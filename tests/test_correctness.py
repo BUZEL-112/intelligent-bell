@@ -25,7 +25,11 @@ from speccache.kernels.reference import (
     dequant_and_rope_key_ref,
     dequant_value_compiled,
     dequant_value_ref,
+    pytorch_compiled_dequant_rope_shift,
+    pytorch_eager_dequant_rope_shift,
+    quantize_kv_int8,
     quantize_symmetric_int8,
+    rotate_half,
     validate_key_inputs,
     validate_value_inputs,
 )
@@ -71,6 +75,25 @@ def _create_mock_quantized_value(
 # ==============================================================================
 # Reference Implementation & Mathematical Invariant Tests
 # ==============================================================================
+
+def test_rotate_half():
+    """Verify rotate_half maps [x1, x2] to [-x2, x1]."""
+    x = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])  # shape [1, 1, 4]
+    rotated = rotate_half(x)
+    expected = torch.tensor([[[-3.0, -4.0, 1.0, 2.0]]])
+    assert torch.equal(rotated, expected)
+
+
+def test_quantize_kv_int8_absmax():
+    """Verify dynamic per-token-head absmax scale calculation and int8 clamping."""
+    x = torch.tensor([[[-127.0, 0.0, 63.5, 127.0]]], dtype=torch.float32)
+    q, s = quantize_kv_int8(x)
+    assert q.dtype == torch.int8
+    assert s.dtype == torch.float16
+    assert s.shape == (1, 1, 1)
+    assert torch.isclose(s.squeeze(), torch.tensor(1.0, dtype=torch.float16), atol=1e-4)
+    assert torch.equal(q, torch.tensor([[[-127, 0, 64, 127]]], dtype=torch.int8))
+
 
 def test_reference_zero_shift_identity():
     """Rotating by Delta p = 0 must mathematically equal pure INT8 dequantization."""

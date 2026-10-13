@@ -10,7 +10,11 @@ from speccache.kernels.reference import (
     dequant_and_rope_key_ref,
     dequant_value_compiled,
     dequant_value_ref,
+    pytorch_compiled_dequant_rope_shift,
+    pytorch_eager_dequant_rope_shift,
+    quantize_kv_int8,
     quantize_symmetric_int8,
+    rotate_half,
 )
 from speccache.kernels.triton_rope_kv import (
     dequant_and_rope_key,
@@ -27,5 +31,9 @@ __all__ = [
     "dequant_value",
     "dequant_value_compiled",
     "dequant_value_ref",
+    "pytorch_compiled_dequant_rope_shift",
+    "pytorch_eager_dequant_rope_shift",
+    "quantize_kv_int8",
     "quantize_symmetric_int8",
+    "rotate_half",
 ]

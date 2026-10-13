@@ -173,53 +173,63 @@ def compute_rope_cos_sin_delta(
     return cos_delta, sin_delta
 
 
-def quantize_symmetric_int8(
-    tensor: torch.Tensor,
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims of the input using HuggingFace style pairing.
+
+    For head dimension D, maps [x1, x2] to [-x2, x1].
+    """
+    d_half = x.shape[-1] // 2
+    x1 = x[..., :d_half]
+    x2 = x[..., d_half:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def quantize_kv_int8(
+    x: torch.Tensor,
     eps: float = 1e-5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric per-token-head INT8 quantization for KV cache states.
+    """Quantize floating-point KV tensor to INT8 with dynamic per-token-head absmax scale.
 
-    Maps floating-point values in [-max_val, max_val] to integer range [-127, 127].
-    The quantization scale is stored per token-head slice with shape [T, H, 1].
+    Computes dynamic per-token, per-head absmax scale:
+        scale = x.abs().amax(dim=-1, keepdim=True) / 127.0
+    Clamps and rounds to torch.int8 in range [-127, 127].
 
     Args:
-        tensor: Floating-point tensor of shape [T, H, D].
+        x: Floating-point tensor of shape [num_tokens, num_kv_heads, head_dim].
         eps: Small epsilon preventing division by zero for all-zero slices.
 
     Returns:
-        quant: torch.int8 tensor of shape [T, H, D].
-        scale: torch.float16 tensor of shape [T, H, 1].
+        quant: torch.int8 tensor of shape [num_tokens, num_kv_heads, head_dim].
+        scale: torch.float16 tensor of shape [num_tokens, num_kv_heads, 1].
     """
-    if tensor.ndim != 3:
-        raise ValueError(f"Input tensor must have shape [T, H, D], got {tensor.shape}")
+    if x.ndim != 3:
+        raise ValueError(f"Input tensor must have shape [T, H, D], got {x.shape}")
 
-    abs_max = torch.amax(torch.abs(tensor.to(torch.float32)), dim=-1, keepdim=True)
+    abs_max = x.to(torch.float32).abs().amax(dim=-1, keepdim=True)
     scale = torch.clamp(abs_max / 127.0, min=eps).to(torch.float16)
 
-    # Symmetric clamp to [-127, 127]
-    scaled = tensor.to(torch.float32) / scale.to(torch.float32)
+    scaled = x.to(torch.float32) / scale.to(torch.float32)
     quant = torch.clamp(torch.round(scaled), -127.0, 127.0).to(torch.int8)
     return quant, scale
 
 
-def dequant_and_rope_key_ref(
+# Backward compatibility alias
+quantize_symmetric_int8 = quantize_kv_int8
+
+
+def pytorch_eager_dequant_rope_shift(
     k_quant: torch.Tensor,
     k_scale: torch.Tensor,
     cos_delta: torch.Tensor,
     sin_delta: torch.Tensor,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Eager PyTorch reference for fused INT8 dequantization and relative RoPE.
+    """Eager PyTorch baseline for fused INT8 dequantization and relative RoPE phase-shifting.
 
-    Implements the HuggingFace Llama/Qwen half-rotated RoPE pairing convention:
-    Pair index i in [0, D // 2) with index i + D // 2:
-        x1 = q_x1 * scale
-        x2 = q_x2 * scale
-        out1 = x1 * cos - x2 * sin
-        out2 = x2 * cos + x1 * sin
-
-    Accumulation is performed in FP32 to ensure strict numerical ground truth,
-    then cast to FP16.
+    Dequantizes INT8 keys to FP16 and applies rotary embeddings using the
+    standard HuggingFace rotate_half convention:
+        k_dequant = k_quant * k_scale
+        k_out = (k_dequant * cos) + (rotate_half(k_dequant) * sin)
 
     Args:
         k_quant: INT8 quantized keys [T, H, D].
@@ -233,34 +243,31 @@ def dequant_and_rope_key_ref(
     """
     validate_key_inputs(k_quant, k_scale, cos_delta, sin_delta, out)
 
-    t, h, d = k_quant.shape
-    d_half = d // 2
+    # Dequantize with FP32 precision
+    k_dequant = (k_quant.to(torch.float32) * k_scale.to(torch.float32)).to(torch.float16)
 
-    # Cast INT8 to FP32 and multiply by scale in FP32 for precision
-    q_fp32 = k_quant.to(torch.float32)
-    scale_fp32 = k_scale.to(torch.float32)
-    k_dequant = q_fp32 * scale_fp32
+    # In HuggingFace Llama rotate_half convention, cos and sin are duplicated
+    # across both halves: shape [..., D]
+    cos_full = torch.cat([cos_delta, cos_delta], dim=-1).to(torch.float32)
+    sin_full = torch.cat([sin_delta, sin_delta], dim=-1).to(torch.float32)
 
-    # Split into first half [0, D/2) and second half [D/2, D)
-    x1 = k_dequant[..., :d_half]
-    x2 = k_dequant[..., d_half:]
+    # Unsqueeze head dimension: [1, 1, D] or [T, 1, D]
+    cos_bcast = cos_full[:, None, :]
+    sin_bcast = sin_full[:, None, :]
 
-    # Prepare broadcastable cos and sin:
-    # If shape is [1, D/2], unsqueeze to [1, 1, D/2]
-    # If shape is [T, D/2], unsqueeze to [T, 1, D/2]
-    cos_bcast = cos_delta[:, None, :].to(torch.float32)
-    sin_bcast = sin_delta[:, None, :].to(torch.float32)
-
-    # Relative rotary phase-shifting
-    out1 = x1 * cos_bcast - x2 * sin_bcast
-    out2 = x2 * cos_bcast + x1 * sin_bcast
-
-    result = torch.cat([out1, out2], dim=-1).to(torch.float16)
+    # Apply rotary embedding: (x * cos) + (rotate_half(x) * sin)
+    k_dequant_f32 = k_dequant.to(torch.float32)
+    rotated = (k_dequant_f32 * cos_bcast) + (rotate_half(k_dequant_f32) * sin_bcast)
+    result = rotated.to(torch.float16)
 
     if out is not None:
         out.copy_(result)
         return out
     return result
+
+
+# Reference alias
+dequant_and_rope_key_ref = pytorch_eager_dequant_rope_shift
 
 
 def dequant_value_ref(
@@ -282,7 +289,6 @@ def dequant_value_ref(
     """
     validate_value_inputs(v_quant, v_scale, out)
 
-    # Dequantize with FP32 intermediate product
     result = (v_quant.to(torch.float32) * v_scale.to(torch.float32)).to(torch.float16)
 
     if out is not None:
@@ -291,31 +297,21 @@ def dequant_value_ref(
     return result
 
 
-# Compiled baseline wrappers for torch.compile
+# Compiled baseline wrapped with mode="max-autotune-no-cudagraphs"
 try:
-    _compiled_key_ref = torch.compile(dequant_and_rope_key_ref, mode="reduce-overhead")
-    _compiled_val_ref = torch.compile(dequant_value_ref, mode="reduce-overhead")
+    pytorch_compiled_dequant_rope_shift = torch.compile(
+        pytorch_eager_dequant_rope_shift,
+        mode="max-autotune-no-cudagraphs",
+    )
+    _compiled_val_ref = torch.compile(
+        dequant_value_ref,
+        mode="max-autotune-no-cudagraphs",
+    )
 except Exception:
-    # Fallback to eager function when torch.compile is unavailable or unsupported
-    _compiled_key_ref = dequant_and_rope_key_ref
+    pytorch_compiled_dequant_rope_shift = pytorch_eager_dequant_rope_shift
     _compiled_val_ref = dequant_value_ref
 
 
-def dequant_and_rope_key_compiled(
-    k_quant: torch.Tensor,
-    k_scale: torch.Tensor,
-    cos_delta: torch.Tensor,
-    sin_delta: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Compiled baseline wrapper using torch.compile."""
-    return _compiled_key_ref(k_quant, k_scale, cos_delta, sin_delta, out)
-
-
-def dequant_value_compiled(
-    v_quant: torch.Tensor,
-    v_scale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Compiled baseline wrapper using torch.compile."""
-    return _compiled_val_ref(v_quant, v_scale, out)
+# Compatibility aliases
+dequant_and_rope_key_compiled = pytorch_compiled_dequant_rope_shift
+dequant_value_compiled = _compiled_val_ref
