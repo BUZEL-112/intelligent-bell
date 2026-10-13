@@ -16,8 +16,8 @@ pytest tests/test_phase2_engine.py -v
 
 # Step 3: Run Phase 2 PCIe DMA benchmark
 echo "[3/3] Running Phase 2 PCIe DMA and kernel overlap benchmark..."
-python benchmarks/bench_phase2_dma.py --output-plot benchmarks/phase2_dma_overlap.png
+python benchmarks/bench_phase2_dma.py --output-plot benchmarks/phase2_dma_pipeline.png
 
 echo "======================================================================"
-echo "Phase 2 complete. Benchmark plot saved to: benchmarks/phase2_dma_overlap.png"
+echo "Phase 2 complete. Benchmark plot saved to: benchmarks/phase2_dma_pipeline.png"
 echo "======================================================================"

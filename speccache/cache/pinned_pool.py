@@ -1,12 +1,15 @@
-"""Page-locked (pinned) host memory pool and LRU slab allocator for SpecCache.
+"""Page-locked (pinned) host memory pool and slab allocator for SpecCache Phase 2.
 
-Hardware & Systems Motivation:
-Standard pageable CPU memory forces the CUDA runtime to copy buffers through an
-internal page-locked staging area before dispatching PCIe DMA requests, reducing
-effective PCIe Gen4 bandwidth by up to 50%. By allocating a pre-sized contiguous
-host arena backed by page-locked memory (cudaHostAlloc / pin_memory), DMA engines
-read host memory directly via cudaMemcpyAsync (non_blocking=True), achieving peak
-PCIe transfer speeds.
+Systems & Hardware Grounding:
+Standard pageable CPU memory forces the CUDA runtime to stage transfers through
+an internal intermediate bounce-buffer, halving effective PCIe throughput.
+PinnedKVPool pre-allocates a contiguous, page-locked (pin_memory=True) CPU host
+slab allocator for quantized INT8 Key/Value states and FP16 scales.
+
+Provides:
+- O(1) LRU eviction via collections.OrderedDict.
+- Zero-copy sliced views for asynchronous PCIe DMA transfers (cudaMemcpyAsync).
+- Integer metadata tracking original token start positions (p_cached) for relative RoPE.
 """
 
 from collections import OrderedDict
@@ -17,40 +20,41 @@ import torch
 
 
 @dataclass
-class BlockMetadata:
-    """Metadata describing a cached KV chunk stored in the pinned pool."""
+class OriginalPositionMetadata:
+    """Metadata tracking a cached KV block inside the pinned host pool."""
     block_id: int
-    cached_position: int
-    token_ids: Tuple[int, ...]
-    continuation_tokens: List[int] = field(default_factory=list)
+    start_pos: int
+    token_ids: Tuple[int, ...] = field(default_factory=tuple)
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
 
 
-class PinnedHostPool:
-    """Page-locked host memory slab allocator with LRU eviction management.
+# Backward compatibility alias
+BlockMetadata = OriginalPositionMetadata
 
-    Pre-allocates contiguous memory arenas on the host for INT8 quantized Key and
-    Value tensors along with their per-token-head FP16 scales.
+
+class PinnedKVPool:
+    """Page-locked (pinned) host memory pool and LRU slab allocator.
+
+    Pre-allocates contiguous memory slabs on host CPU with pin_memory=True
+    to enable maximum PCIe DMA bandwidth without intermediate staging.
     """
 
     def __init__(
         self,
         max_blocks: int,
         chunk_size: int,
-        num_kv_heads: int,
+        num_heads: int,
         head_dim: int,
-        device: Optional[torch.device] = None,
         on_evict_callback: Optional[Callable[[int], None]] = None,
     ) -> None:
-        """Initialize the pinned host memory pool.
+        """Initialize page-locked host memory pool.
 
         Args:
-            max_blocks: Maximum number of chunk blocks stored in the arena.
-            chunk_size: Token count per chunk (e.g., 64, 128, 256).
-            num_kv_heads: Number of Key-Value heads (GQA/MHA).
+            max_blocks: Capacity in number of cached chunk blocks.
+            chunk_size: Number of tokens per chunk (e.g., 128, 256).
+            num_heads: Number of KV heads (e.g., 8 for GQA, 32 for MHA).
             head_dim: Head dimension D (e.g., 64, 128).
-            device: Target GPU device for pinned transfers.
             on_evict_callback: Optional callback invoked when a block_id is evicted.
         """
         if max_blocks <= 0:
@@ -60,50 +64,53 @@ class PinnedHostPool:
 
         self.max_blocks = max_blocks
         self.chunk_size = chunk_size
-        self.num_kv_heads = num_kv_heads
+        self.num_heads = num_heads
         self.head_dim = head_dim
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.on_evict_callback = on_evict_callback
 
-        # Allocate contiguous CPU memory arenas
-        self._host_k_quant = torch.empty(
-            (max_blocks, chunk_size, num_kv_heads, head_dim),
+        # Contiguous CPU memory slabs
+        self.k_quant = torch.empty(
+            (max_blocks, chunk_size, num_heads, head_dim),
             dtype=torch.int8,
             device="cpu",
         )
-        self._host_k_scale = torch.empty(
-            (max_blocks, chunk_size, num_kv_heads, 1),
+        self.k_scale = torch.empty(
+            (max_blocks, chunk_size, num_heads, 1),
             dtype=torch.float16,
             device="cpu",
         )
-        self._host_v_quant = torch.empty(
-            (max_blocks, chunk_size, num_kv_heads, head_dim),
+        self.v_quant = torch.empty(
+            (max_blocks, chunk_size, num_heads, head_dim),
             dtype=torch.int8,
             device="cpu",
         )
-        self._host_v_scale = torch.empty(
-            (max_blocks, chunk_size, num_kv_heads, 1),
+        self.v_scale = torch.empty(
+            (max_blocks, chunk_size, num_heads, 1),
             dtype=torch.float16,
             device="cpu",
         )
 
-        # Pin memory if CUDA is supported and available
+        # Track original token start position (p_cached) for relative RoPE phase shift
+        self.original_start_pos = torch.full((max_blocks,), -1, dtype=torch.long, device="cpu")
+
+        # Page-lock host memory if CUDA runtime is available
         self._is_pinned = False
         if torch.cuda.is_available():
             try:
-                self._host_k_quant = self._host_k_quant.pin_memory()
-                self._host_k_scale = self._host_k_scale.pin_memory()
-                self._host_v_quant = self._host_v_quant.pin_memory()
-                self._host_v_scale = self._host_v_scale.pin_memory()
+                self.k_quant = self.k_quant.pin_memory()
+                self.k_scale = self.k_scale.pin_memory()
+                self.v_quant = self.v_quant.pin_memory()
+                self.v_scale = self.v_scale.pin_memory()
+                self.original_start_pos = self.original_start_pos.pin_memory()
                 self._is_pinned = True
             except Exception:
                 self._is_pinned = False
 
-        # Slab allocator free list
+        # Slab allocator: free slot stack
         self._free_block_ids: List[int] = list(range(max_blocks))
 
-        # LRU eviction tracking: block_id -> BlockMetadata
-        self._active_blocks: OrderedDict[int, BlockMetadata] = OrderedDict()
+        # O(1) LRU eviction tracking: block_id -> OriginalPositionMetadata
+        self._active_lru: OrderedDict[int, OriginalPositionMetadata] = OrderedDict()
 
     @property
     def is_pinned(self) -> bool:
@@ -113,132 +120,141 @@ class PinnedHostPool:
     @property
     def allocated_count(self) -> int:
         """Number of active blocks currently held in the pool."""
-        return len(self._active_blocks)
+        return len(self._active_lru)
 
     @property
     def free_count(self) -> int:
         """Number of unoccupied block slots available without eviction."""
         return len(self._free_block_ids)
 
-    def allocate(
-        self,
-        cached_position: int,
-        token_ids: Tuple[int, ...],
-        continuation_tokens: Optional[List[int]] = None,
-    ) -> int:
-        """Allocate a block slot from the arena, evicting the LRU block if full.
+    def allocate(self) -> int:
+        """Allocate a block slot from the arena in O(1).
 
-        Args:
-            cached_position: Original token position m for RoPE displacement calculation.
-            token_ids: Sequence of token integers for this chunk.
-            continuation_tokens: Following tokens for speculative draft candidates.
+        If the pool is full, evicts the least recently used block via OrderedDict.
 
         Returns:
-            block_id: Integer index into the pinned slab arena in [0, max_blocks).
+            block_id: Integer index in [0, max_blocks).
         """
         if self._free_block_ids:
             block_id = self._free_block_ids.pop()
         else:
-            # Evict least-recently used block (first entry in OrderedDict)
-            block_id, old_meta = self._active_blocks.popitem(last=False)
+            # Evict least recently used block (first entry in OrderedDict)
+            block_id, old_meta = self._active_lru.popitem(last=False)
             if self.on_evict_callback is not None:
                 self.on_evict_callback(block_id)
 
-        meta = BlockMetadata(
+        meta = OriginalPositionMetadata(
             block_id=block_id,
-            cached_position=cached_position,
-            token_ids=token_ids,
-            continuation_tokens=continuation_tokens or [],
+            start_pos=-1,
             created_at=time.time(),
             last_accessed=time.time(),
         )
-        self._active_blocks[block_id] = meta
+        self._active_lru[block_id] = meta
         return block_id
 
-    def write_chunk(
+    def touch(self, block_id: int) -> None:
+        """Mark block as recently accessed in O(1) LRU ordering."""
+        if block_id in self._active_lru:
+            meta = self._active_lru[block_id]
+            meta.last_accessed = time.time()
+            self._active_lru.move_to_end(block_id)
+
+    def write_block(
         self,
         block_id: int,
-        k_quant: torch.Tensor,
-        k_scale: torch.Tensor,
-        v_quant: torch.Tensor,
-        v_scale: torch.Tensor,
+        k_q: torch.Tensor,
+        k_s: torch.Tensor,
+        v_q: torch.Tensor,
+        v_s: torch.Tensor,
+        start_pos: int,
+        token_ids: Optional[Tuple[int, ...]] = None,
     ) -> None:
-        """Copy quantized Key and Value tensors into the assigned block slot.
+        """Write quantized Key and Value tensors into the assigned block slot.
 
         Args:
             block_id: Target block index in [0, max_blocks).
-            k_quant: Tensor of shape [chunk_size, num_kv_heads, head_dim], int8.
-            k_scale: Tensor of shape [chunk_size, num_kv_heads, 1], float16.
-            v_quant: Tensor of shape [chunk_size, num_kv_heads, head_dim], int8.
-            v_scale: Tensor of shape [chunk_size, num_kv_heads, 1], float16.
+            k_q: Quantized keys [chunk_size, num_heads, head_dim], int8.
+            k_s: Scale factors [chunk_size, num_heads, 1], float16.
+            v_q: Quantized values [chunk_size, num_heads, head_dim], int8.
+            v_s: Scale factors [chunk_size, num_heads, 1], float16.
+            start_pos: Original token start position p_cached.
+            token_ids: Optional tuple of token IDs for this chunk.
         """
-        if block_id not in self._active_blocks:
+        if block_id not in self._active_lru:
             raise KeyError(f"Block ID {block_id} is not an allocated active block.")
 
-        expected_k_shape = (self.chunk_size, self.num_kv_heads, self.head_dim)
-        expected_s_shape = (self.chunk_size, self.num_kv_heads, 1)
+        expected_kv_shape = (self.chunk_size, self.num_heads, self.head_dim)
+        expected_s_shape = (self.chunk_size, self.num_heads, 1)
 
-        if k_quant.shape != expected_k_shape or k_quant.dtype != torch.int8:
-            raise ValueError(f"k_quant shape {k_quant.shape} dtype {k_quant.dtype} invalid.")
-        if k_scale.shape != expected_s_shape or k_scale.dtype != torch.float16:
-            raise ValueError(f"k_scale shape {k_scale.shape} dtype {k_scale.dtype} invalid.")
-        if v_quant.shape != expected_k_shape or v_quant.dtype != torch.int8:
-            raise ValueError(f"v_quant shape {v_quant.shape} dtype {v_quant.dtype} invalid.")
-        if v_scale.shape != expected_s_shape or v_scale.dtype != torch.float16:
-            raise ValueError(f"v_scale shape {v_scale.shape} dtype {v_scale.dtype} invalid.")
+        if k_q.shape != expected_kv_shape or k_q.dtype != torch.int8:
+            raise ValueError(f"k_q shape {k_q.shape} dtype {k_q.dtype} invalid.")
+        if k_s.shape != expected_s_shape or k_s.dtype != torch.float16:
+            raise ValueError(f"k_s shape {k_s.shape} dtype {k_s.dtype} invalid.")
+        if v_q.shape != expected_kv_shape or v_q.dtype != torch.int8:
+            raise ValueError(f"v_q shape {v_q.shape} dtype {v_q.dtype} invalid.")
+        if v_s.shape != expected_s_shape or v_s.dtype != torch.float16:
+            raise ValueError(f"v_s shape {v_s.shape} dtype {v_s.dtype} invalid.")
 
-        # Copy data into host memory slab
-        self._host_k_quant[block_id].copy_(k_quant, non_blocking=False)
-        self._host_k_scale[block_id].copy_(k_scale, non_blocking=False)
-        self._host_v_quant[block_id].copy_(v_quant, non_blocking=False)
-        self._host_v_scale[block_id].copy_(v_scale, non_blocking=False)
+        self.k_quant[block_id].copy_(k_q, non_blocking=False)
+        self.k_scale[block_id].copy_(k_s, non_blocking=False)
+        self.v_quant[block_id].copy_(v_q, non_blocking=False)
+        self.v_scale[block_id].copy_(v_s, non_blocking=False)
+        self.original_start_pos[block_id] = start_pos
 
+        meta = self._active_lru[block_id]
+        meta.start_pos = start_pos
+        if token_ids is not None:
+            meta.token_ids = token_ids
         self.touch(block_id)
 
-    def read_chunk(
+    def get_block_views(
         self,
         block_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Retrieve memory slice references for a block and update its LRU recency.
+        """Return zero-copy slice views into pinned host slabs for DMA transfer.
+
+        Args:
+            block_id: Target block index in [0, max_blocks).
 
         Returns:
-            Tuple containing (k_quant, k_scale, v_quant, v_scale) pinned host slices.
+            Tuple containing (k_quant, k_scale, v_quant, v_scale) pinned host tensor views.
         """
-        if block_id not in self._active_blocks:
-            raise KeyError(f"Block ID {block_id} is not allocated.")
+        if block_id not in self._active_lru:
+            raise KeyError(f"Block ID {block_id} is not an allocated active block.")
 
         self.touch(block_id)
         return (
-            self._host_k_quant[block_id],
-            self._host_k_scale[block_id],
-            self._host_v_quant[block_id],
-            self._host_v_scale[block_id],
+            self.k_quant[block_id],
+            self.k_scale[block_id],
+            self.v_quant[block_id],
+            self.v_scale[block_id],
         )
 
-    def touch(self, block_id: int) -> None:
-        """Mark block as recently used in LRU ordering."""
-        if block_id in self._active_blocks:
-            meta = self._active_blocks[block_id]
-            meta.last_accessed = time.time()
-            self._active_blocks.move_to_end(block_id)
+    def get_start_pos(self, block_id: int) -> int:
+        """Fetch the original token start position (p_cached) for a block."""
+        if block_id not in self._active_lru:
+            raise KeyError(f"Block ID {block_id} is not an allocated active block.")
+        return int(self.original_start_pos[block_id].item())
 
-    def get_metadata(self, block_id: int) -> Optional[BlockMetadata]:
-        """Fetch metadata for a cached block without modifying LRU recency."""
-        return self._active_blocks.get(block_id)
-
-    def free_block(self, block_id: int) -> None:
-        """Explicitly return a block to the free list."""
-        if block_id in self._active_blocks:
-            del self._active_blocks[block_id]
+    def free(self, block_id: int) -> None:
+        """Explicitly release an active block back to the pool."""
+        if block_id in self._active_lru:
+            del self._active_lru[block_id]
+            self.original_start_pos[block_id] = -1
             self._free_block_ids.append(block_id)
             if self.on_evict_callback is not None:
                 self.on_evict_callback(block_id)
 
     def clear(self) -> None:
-        """Reset allocator state, freeing all blocks."""
-        all_ids = list(self._active_blocks.keys())
+        """Reset the allocator and release all blocks."""
+        all_ids = list(self._active_lru.keys())
         for bid in all_ids:
             if self.on_evict_callback is not None:
                 self.on_evict_callback(bid)
-        self._active_blocks.clear()
+        self._active_lru.clear()
+        self.original_start_pos.fill_(-1)
         self._free_block_ids = list(range(self.max_blocks))
+
+
+# Backward compatibility alias
+PinnedHostPool = PinnedKVPool

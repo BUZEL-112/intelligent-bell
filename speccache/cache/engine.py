@@ -1,16 +1,13 @@
-"""SpecCacheEngine: Hybrid Radix-Semantic Lookup & Pinned-Memory DMA Pipeline.
+"""SpecCacheEngine: Integrated Hybrid Radix-Semantic Lookup & Pinned DMA Engine.
 
-Orchestrates:
-1. Chunking prompt token sequences into fixed-size blocks (chunk_size).
-2. Two-tier hierarchical cache lookup:
-   - Tier 1: O(L) exact token-sequence matching via RadixTree.
-   - Tier 2: FAISS HNSW cosine similarity search over chunk embeddings.
-3. Three-way routing decisions:
-   - DIRECT_REUSE: cos_sim >= 0.92 or exact match -> relative RoPE shift + DMA.
-   - SPECULATIVE_DRAFT: 0.80 <= cos_sim < 0.92 -> surfaces draft candidate tokens.
-   - CACHE_MISS: cos_sim < 0.80 -> marks chunk for GPU prefill computation.
-4. Asynchronous double-buffered PCIe DMA pipeline overlapping host-to-device
-   transfers of chunk i+1 with Phase 1 Triton kernel execution of chunk i.
+Integrates:
+- PinnedKVPool: Page-locked host memory slab allocator with O(1) LRU eviction.
+- ChunkRadixTree: Token-level prefix tree for Tier 1 O(L) exact chunk matching.
+- SemanticHNSWIndex: FAISS HNSW vector search for Tier 2 semantic matching with
+  threshold routing (EXACT_OR_REUSE >= 0.92, SPECULATIVE [0.80, 0.92), MISS < 0.80).
+- Phase 1 Triton Kernels: Fused INT8 dequantization + relative RoPE phase-shifting.
+- Asynchronous Double-Buffered DMA Pipeline: Overlapped PCIe host-to-device transfers
+  and Triton kernel execution on dedicated CUDA streams.
 """
 
 from dataclasses import dataclass, field
@@ -19,12 +16,12 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from speccache.cache.pinned_pool import PinnedHostPool
-from speccache.cache.radix_index import RadixMatchResult, RadixTree
+from speccache.cache.pinned_pool import OriginalPositionMetadata, PinnedKVPool
+from speccache.cache.radix_index import ChunkRadixTree, RadixMatchResult
 from speccache.cache.semantic_index import (
+    RouteDecision,
+    SemanticHNSWIndex,
     SemanticLookupResult,
-    SemanticRoutingAction,
-    SemanticIndex,
 )
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
@@ -47,7 +44,7 @@ class ChunkRoutingStatus(str, Enum):
     EXACT_REUSE = "EXACT_REUSE"              # Tier 1 exact Radix hit
     SEMANTIC_REUSE = "SEMANTIC_REUSE"        # Tier 2 cosine similarity >= 0.92
     SPECULATIVE_DRAFT = "SPECULATIVE_DRAFT"  # Tier 2 0.80 <= similarity < 0.92
-    CACHE_MISS = "CACHE_MISS"                # Similarity < 0.80 (must compute prefill)
+    CACHE_MISS = "CACHE_MISS"                # Similarity < 0.80
 
 
 @dataclass
@@ -66,11 +63,7 @@ class ChunkRoutingDecision:
 
 
 class SpecCacheEngine:
-    """Production orchestration engine for SpecCache Phase 2.
-
-    Integrates pinned host memory allocation, Radix exact lookup, FAISS semantic
-    indexing, and double-buffered asynchronous PCIe DMA pipeline execution.
-    """
+    """Orchestration engine for SpecCache Phase 2."""
 
     def __init__(
         self,
@@ -87,14 +80,14 @@ class SpecCacheEngine:
         """Initialize the SpecCache engine.
 
         Args:
-            chunk_size: Number of tokens per fixed-size chunk block.
-            num_kv_heads: Number of Key-Value heads (e.g. 8 for Llama-3-8B GQA).
-            head_dim: Hidden dimension D of each head (e.g. 128).
-            max_blocks: Maximum chunks stored in the pinned host memory pool.
+            chunk_size: Token count per chunk (e.g., 128, 256).
+            num_kv_heads: Number of KV heads (e.g. 8 for Llama-3-8B GQA).
+            head_dim: Head dimension D (e.g. 128).
+            max_blocks: Maximum chunks stored in PinnedKVPool.
             embedding_dim: Dimensionality of semantic chunk embedding vectors.
             tau_reuse: Cosine similarity threshold for direct KV reuse (0.92).
             tau_spec: Cosine similarity threshold for speculative drafting (0.80).
-            device: Target GPU device (default cuda:0 if available, else cpu).
+            device: Target GPU device.
             force_fallback_semantic: Use PyTorch fallback index instead of FAISS.
         """
         self.chunk_size = chunk_size
@@ -107,21 +100,20 @@ class SpecCacheEngine:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # 1. Pinned Host Memory Slab Allocator with LRU Eviction
-        self.pool = PinnedHostPool(
+        self.pool = PinnedKVPool(
             max_blocks=max_blocks,
             chunk_size=chunk_size,
-            num_kv_heads=num_kv_heads,
+            num_heads=num_kv_heads,
             head_dim=head_dim,
-            device=self.device,
             on_evict_callback=self._handle_lru_eviction,
         )
 
-        # 2. Tier 1: Token-Level Radix Tree for Exact Matching
-        self.radix_tree = RadixTree()
+        # 2. Tier 1: Token-Level Chunk Radix Tree
+        self.radix_tree = ChunkRadixTree(chunk_size=chunk_size)
 
         # 3. Tier 2: FAISS HNSW Semantic Vector Index
-        self.semantic_index = SemanticIndex(
-            embedding_dim=embedding_dim,
+        self.semantic_index = SemanticHNSWIndex(
+            embed_dim=embedding_dim,
             tau_reuse=tau_reuse,
             tau_spec=tau_spec,
             force_fallback=force_fallback_semantic,
@@ -155,49 +147,42 @@ class SpecCacheEngine:
         """Register a new quantized INT8 KV chunk into the host cache and indices.
 
         Args:
-            token_ids: Token integer sequence of length equal to chunk_size.
-            cached_position: Token index m where the keys were originally rotated.
-            k_quant: INT8 quantized keys [chunk_size, num_kv_heads, head_dim].
-            k_scale: FP16 scales [chunk_size, num_kv_heads, 1].
-            v_quant: INT8 quantized values [chunk_size, num_kv_heads, head_dim].
-            v_scale: FP16 scales [chunk_size, num_kv_heads, 1].
-            embedding: Optional semantic embedding vector of length embedding_dim.
-            continuation_tokens: Optional continuation tokens following this chunk.
+            token_ids: Sequence of integer token IDs (length equal to chunk_size).
+            cached_position: Token position p_cached when originally rotated.
+            k_quant: INT8 quantized keys [chunk_size, num_heads, head_dim].
+            k_scale: FP16 scales [chunk_size, num_heads, 1].
+            v_quant: INT8 quantized values [chunk_size, num_heads, head_dim].
+            v_scale: FP16 scales [chunk_size, num_heads, 1].
+            embedding: Optional semantic embedding vector.
+            continuation_tokens: Optional draft tokens.
 
         Returns:
-            block_id: Assigned block index in the pinned pool.
+            block_id: Assigned block index in PinnedKVPool.
         """
         tokens = tuple(token_ids)
         if len(tokens) != self.chunk_size:
             raise ValueError(
-                f"token_ids length ({len(tokens)}) must match chunk_size ({self.chunk_size})."
+                f"token_ids length ({len(tokens)}) must equal chunk_size ({self.chunk_size})."
             )
 
-        # Allocate slot in pinned host memory pool
-        block_id = self.pool.allocate(
-            cached_position=cached_position,
-            token_ids=tokens,
-            continuation_tokens=continuation_tokens,
-        )
+        block_id = self.pool.allocate()
 
-        # Copy INT8 KV tensors into the pinned slab
-        self.pool.write_chunk(
+        self.pool.write_block(
             block_id=block_id,
-            k_quant=k_quant,
-            k_scale=k_scale,
-            v_quant=v_quant,
-            v_scale=v_scale,
+            k_q=k_quant,
+            k_s=k_scale,
+            v_q=v_quant,
+            v_s=v_scale,
+            start_pos=cached_position,
+            token_ids=tokens,
         )
 
-        # Insert into Tier 1 Radix Tree
         self.radix_tree.insert(
             token_ids=tokens,
-            block_id=block_id,
+            block_ids=block_id,
             cached_position=cached_position,
-            continuation_tokens=continuation_tokens,
         )
 
-        # Insert into Tier 2 Semantic Index
         if embedding is not None:
             self.semantic_index.add(
                 embedding=embedding,
@@ -209,48 +194,60 @@ class SpecCacheEngine:
 
         return block_id
 
-    def lookup_chunks(
+    def retrieve_and_reconstruct_kv(
         self,
-        prompt_tokens: Sequence[int],
-        chunk_embeddings: Optional[Sequence[Union[np.ndarray, torch.Tensor]]] = None,
-    ) -> List[ChunkRoutingDecision]:
-        """Perform two-tier lookup across all fixed-size chunks in the prompt sequence.
+        chunks_tokens: Sequence[Sequence[int]],
+        chunks_embeddings: Optional[Sequence[Union[np.ndarray, torch.Tensor]]] = None,
+        target_positions: Optional[Sequence[int]] = None,
+        cos_table: Optional[torch.Tensor] = None,
+        sin_table: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[ChunkRoutingDecision]]:
+        """Retrieve cached blocks via two-tier routing and reconstruct GPU FP16 KV caches.
+
+        Executes:
+        1. Tier 1 Radix exact match and Tier 2 Semantic HNSW lookup per chunk.
+        2. Computes relative displacement Delta p = p_target - p_cached.
+        3. Executes pipelined double-buffered asynchronous PCIe DMA + Triton kernel.
 
         Args:
-            prompt_tokens: Complete token ID sequence of the prompt.
-            chunk_embeddings: Optional semantic embeddings for each chunk block.
+            chunks_tokens: List of token sequences (each of length chunk_size).
+            chunks_embeddings: Optional list of semantic embedding vectors.
+            target_positions: List of target token start positions for each chunk.
+            cos_table: Optional precomputed RoPE cos table.
+            sin_table: Optional precomputed RoPE sin table.
 
         Returns:
-            decisions: List of ChunkRoutingDecision objects for each chunk.
+            Tuple of (k_cache, v_cache, decisions).
         """
-        tokens = list(prompt_tokens)
-        num_chunks = len(tokens) // self.chunk_size
+        num_chunks = len(chunks_tokens)
+        if target_positions is None:
+            target_positions = [c * self.chunk_size for c in range(num_chunks)]
+
         decisions: List[ChunkRoutingDecision] = []
 
         for i in range(num_chunks):
-            start_pos = i * self.chunk_size
-            end_pos = start_pos + self.chunk_size
-            chunk_tokens = tuple(tokens[start_pos:end_pos])
-            embedding = chunk_embeddings[i] if chunk_embeddings and i < len(chunk_embeddings) else None
+            c_toks = tuple(chunks_tokens[i])
+            p_target = target_positions[i]
+            emb = chunks_embeddings[i] if chunks_embeddings is not None and i < len(chunks_embeddings) else None
 
             # ------------------------------------------------------------------
             # Tier 1: Token-Level Radix Tree Exact Match
             # ------------------------------------------------------------------
-            radix_hit = self.radix_tree.match_exact(chunk_tokens)
+            radix_hit = self.radix_tree.match_exact(c_toks)
             if radix_hit is not None:
-                delta_p = start_pos - radix_hit.cached_position
+                p_cached = self.pool.get_start_pos(radix_hit.block_id)
+                delta_p = p_target - p_cached
                 decisions.append(
                     ChunkRoutingDecision(
                         chunk_index=i,
-                        target_start_pos=start_pos,
-                        target_end_pos=end_pos,
-                        token_ids=chunk_tokens,
+                        target_start_pos=p_target,
+                        target_end_pos=p_target + self.chunk_size,
+                        token_ids=c_toks,
                         status=ChunkRoutingStatus.EXACT_REUSE,
                         similarity=1.0,
                         block_id=radix_hit.block_id,
-                        cached_position=radix_hit.cached_position,
+                        cached_position=p_cached,
                         delta_p=delta_p,
-                        continuation_tokens=radix_hit.continuation_tokens,
                     )
                 )
                 self.pool.touch(radix_hit.block_id)
@@ -259,42 +256,40 @@ class SpecCacheEngine:
             # ------------------------------------------------------------------
             # Tier 2: FAISS HNSW Semantic Vector Match
             # ------------------------------------------------------------------
-            if embedding is not None:
-                semantic_hit = self.semantic_index.search(embedding)
+            if emb is not None:
+                decision, similarity, block_id, cached_pos = self.semantic_index.query(emb)
 
-                if semantic_hit.action == SemanticRoutingAction.DIRECT_REUSE:
-                    delta_p = start_pos - (semantic_hit.cached_position or 0)
+                if decision == RouteDecision.EXACT_OR_REUSE and block_id is not None:
+                    p_cached = cached_pos if cached_pos is not None else self.pool.get_start_pos(block_id)
+                    delta_p = p_target - p_cached
                     decisions.append(
                         ChunkRoutingDecision(
                             chunk_index=i,
-                            target_start_pos=start_pos,
-                            target_end_pos=end_pos,
-                            token_ids=chunk_tokens,
+                            target_start_pos=p_target,
+                            target_end_pos=p_target + self.chunk_size,
+                            token_ids=c_toks,
                             status=ChunkRoutingStatus.SEMANTIC_REUSE,
-                            similarity=semantic_hit.similarity,
-                            block_id=semantic_hit.block_id,
-                            cached_position=semantic_hit.cached_position,
+                            similarity=similarity,
+                            block_id=block_id,
+                            cached_position=p_cached,
                             delta_p=delta_p,
-                            continuation_tokens=semantic_hit.continuation_tokens,
                         )
                     )
-                    if semantic_hit.block_id is not None:
-                        self.pool.touch(semantic_hit.block_id)
+                    self.pool.touch(block_id)
                     continue
 
-                if semantic_hit.action == SemanticRoutingAction.SPECULATIVE_DRAFT:
+                if decision == RouteDecision.SPECULATIVE and block_id is not None:
                     decisions.append(
                         ChunkRoutingDecision(
                             chunk_index=i,
-                            target_start_pos=start_pos,
-                            target_end_pos=end_pos,
-                            token_ids=chunk_tokens,
+                            target_start_pos=p_target,
+                            target_end_pos=p_target + self.chunk_size,
+                            token_ids=c_toks,
                             status=ChunkRoutingStatus.SPECULATIVE_DRAFT,
-                            similarity=semantic_hit.similarity,
-                            block_id=semantic_hit.block_id,
-                            cached_position=semantic_hit.cached_position,
+                            similarity=similarity,
+                            block_id=block_id,
+                            cached_position=cached_pos,
                             delta_p=0,
-                            continuation_tokens=semantic_hit.continuation_tokens,
                         )
                     )
                     continue
@@ -305,9 +300,9 @@ class SpecCacheEngine:
             decisions.append(
                 ChunkRoutingDecision(
                     chunk_index=i,
-                    target_start_pos=start_pos,
-                    target_end_pos=end_pos,
-                    token_ids=chunk_tokens,
+                    target_start_pos=p_target,
+                    target_end_pos=p_target + self.chunk_size,
+                    token_ids=c_toks,
                     status=ChunkRoutingStatus.CACHE_MISS,
                     similarity=0.0,
                     block_id=None,
@@ -316,6 +311,44 @@ class SpecCacheEngine:
                 )
             )
 
+        # Execute Double-Buffered Asynchronous DMA + Triton Kernel Pipelining
+        reused_chunks = [
+            d for d in decisions
+            if d.status in (ChunkRoutingStatus.EXACT_REUSE, ChunkRoutingStatus.SEMANTIC_REUSE)
+            and d.block_id is not None
+        ]
+
+        if not reused_chunks:
+            empty = torch.empty((0, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+            return empty, empty, decisions
+
+        total_tokens = len(reused_chunks) * self.chunk_size
+        k_out = torch.empty((total_tokens, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+        v_out = torch.empty((total_tokens, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+
+        k_reconstructed, v_reconstructed = self.execute_async_dma_and_rope(
+            reused_decisions=reused_chunks,
+            dest_k_out=k_out,
+            dest_v_out=v_out,
+        )
+
+        return k_reconstructed, v_reconstructed, decisions
+
+    def lookup_chunks(
+        self,
+        prompt_tokens: Sequence[int],
+        chunk_embeddings: Optional[Sequence[Union[np.ndarray, torch.Tensor]]] = None,
+    ) -> List[ChunkRoutingDecision]:
+        """Convenience method chunking prompt_tokens and querying indices."""
+        tokens = list(prompt_tokens)
+        num_chunks = len(tokens) // self.chunk_size
+        chunks_tokens = [tokens[c * self.chunk_size : (c + 1) * self.chunk_size] for c in range(num_chunks)]
+        target_positions = [c * self.chunk_size for c in range(num_chunks)]
+        _, _, decisions = self.retrieve_and_reconstruct_kv(
+            chunks_tokens=chunks_tokens,
+            chunks_embeddings=chunk_embeddings,
+            target_positions=target_positions,
+        )
         return decisions
 
     def execute_async_dma_and_rope(
@@ -324,19 +357,7 @@ class SpecCacheEngine:
         dest_k_out: Optional[torch.Tensor] = None,
         dest_v_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Execute double-buffered async PCIe DMA transfer overlapped with Triton kernel.
-
-        Overlaps host-to-device PCIe transfer of chunk i+1 with Phase 1 kernel
-        execution of chunk i across dedicated CUDA streams.
-
-        Args:
-            reused_decisions: Decisions marked EXACT_REUSE or SEMANTIC_REUSE.
-            dest_k_out: Optional pre-allocated destination tensor [total_tokens, H, D].
-            dest_v_out: Optional pre-allocated destination tensor [total_tokens, H, D].
-
-        Returns:
-            Tuple of (dest_k_out, dest_v_out) in FP16 on target device.
-        """
+        """Double-buffered asynchronous PCIe DMA pipeline overlapping transfer with Triton kernel."""
         valid_chunks = [
             d for d in reused_decisions
             if d.status in (ChunkRoutingStatus.EXACT_REUSE, ChunkRoutingStatus.SEMANTIC_REUSE)
@@ -354,14 +375,12 @@ class SpecCacheEngine:
         if dest_v_out is None:
             dest_v_out = torch.empty((total_tokens, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
 
-        # If running on CPU or without Triton, execute sequential reference
         if not self._is_cuda or not TRITON_AVAILABLE:
             return self._execute_cpu_fallback(valid_chunks, dest_k_out, dest_v_out)
 
         # ----------------------------------------------------------------------
         # Double-Buffered GPU Staging Buffers for Overlapped DMA + Compute
         # ----------------------------------------------------------------------
-        # Buffer 0 and Buffer 1 in GPU HBM
         stage_k_quant = [
             torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
             torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
@@ -379,20 +398,17 @@ class SpecCacheEngine:
             torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
         ]
 
-        # Synchronization events
         transfer_events = [torch.cuda.Event(), torch.cuda.Event()]
         compute_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         num_chunks = len(valid_chunks)
 
-        # Helper to initiate non-blocking PCIe DMA for chunk into buffer slot
         def initiate_dma(chunk_idx: int, slot: int):
             meta = valid_chunks[chunk_idx]
             assert meta.block_id is not None
-            k_q_host, k_s_host, v_q_host, v_s_host = self.pool.read_chunk(meta.block_id)
+            k_q_host, k_s_host, v_q_host, v_s_host = self.pool.get_block_views(meta.block_id)
 
             with torch.cuda.stream(self.transfer_stream):
-                # Wait for prior compute using this buffer slot to complete
                 if chunk_idx >= 2:
                     self.transfer_stream.wait_event(compute_events[slot])
 
@@ -403,26 +419,21 @@ class SpecCacheEngine:
 
                 transfer_events[slot].record(self.transfer_stream)
 
-        # Helper to execute Triton kernel on staged buffer slot
         def execute_kernel(chunk_idx: int, slot: int):
             meta = valid_chunks[chunk_idx]
             out_offset = chunk_idx * self.chunk_size
 
             with torch.cuda.stream(self.compute_stream):
-                # Wait for DMA transfer of this slot to complete
                 self.compute_stream.wait_event(transfer_events[slot])
 
-                # Destination slices
                 k_dest_slice = dest_k_out[out_offset : out_offset + self.chunk_size]
                 v_dest_slice = dest_v_out[out_offset : out_offset + self.chunk_size]
 
-                # Compute relative RoPE cos and sin tables
                 delta_pos = torch.tensor([meta.delta_p], device=self.device)
                 cos_delta, sin_delta = compute_rope_cos_sin_delta(
                     delta_pos, self.head_dim, device=self.device
                 )
 
-                # Phase 1 Triton Kernels: Fused Key Dequant + RoPE, and Value Dequant
                 triton_fused_k_dequant_rope_shift(
                     stage_k_quant[slot],
                     stage_k_scale[slot],
@@ -438,9 +449,6 @@ class SpecCacheEngine:
 
                 compute_events[slot].record(self.compute_stream)
 
-        # ----------------------------------------------------------------------
-        # Pipeline Execution: Prime Buffer 0, then overlap Loop
-        # ----------------------------------------------------------------------
         # Prime first chunk into slot 0
         initiate_dma(0, slot=0)
 
@@ -448,14 +456,11 @@ class SpecCacheEngine:
             curr_slot = i % 2
             next_slot = (i + 1) % 2
 
-            # Dispatch DMA for chunk i+1 while chunk i is computed
             if i + 1 < num_chunks:
                 initiate_dma(i + 1, slot=next_slot)
 
-            # Compute chunk i
             execute_kernel(i, slot=curr_slot)
 
-        # Synchronize streams with host
         self.compute_stream.synchronize()
         return dest_k_out, dest_v_out
 
@@ -465,10 +470,10 @@ class SpecCacheEngine:
         dest_k_out: torch.Tensor,
         dest_v_out: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sequential CPU reference fallback when CUDA or Triton is unavailable."""
+        """CPU fallback when CUDA or Triton is unavailable."""
         for i, meta in enumerate(valid_chunks):
             assert meta.block_id is not None
-            k_q, k_s, v_q, v_s = self.pool.read_chunk(meta.block_id)
+            k_q, k_s, v_q, v_s = self.pool.get_block_views(meta.block_id)
 
             delta_pos = torch.tensor([meta.delta_p], device=self.device)
             cos_delta, sin_delta = compute_rope_cos_sin_delta(delta_pos, self.head_dim, device=self.device)

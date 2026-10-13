@@ -1,13 +1,14 @@
-"""Token-level Radix Tree for exact prefix and chunk cache matching.
+"""Chunk-level Radix Tree for exact prefix and block matching in SpecCache Phase 2.
 
-Provides:
-- O(L) exact prefix and chunk lookup for reusable prompt blocks.
-- Common-prefix edge compression and splitting.
-- Reverse index mapping for O(1) eviction when the pinned memory pool recycles blocks.
+Implements ChunkRadixTree:
+- Maps tuples of token IDs along a prefix tree to block_ids stored in PinnedKVPool.
+- Supports insert(token_ids, block_ids) across single or multi-chunk prompt sequences.
+- Supports match_prefix(token_ids) -> list[tuple[int, int]] returning matched (chunk_idx, block_id).
+- Handles clean node pruning when PinnedKVPool evicts a block_id.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 
 @dataclass
@@ -20,258 +21,199 @@ class RadixMatchResult:
     continuation_tokens: List[int] = field(default_factory=list)
 
 
-class RadixNode:
-    """Internal node in the Radix tree storing token sub-sequences."""
+class ChunkRadixNode:
+    """Node in the chunk prefix tree representing one fixed-size chunk block."""
 
     def __init__(
         self,
-        token_subsequence: Tuple[int, ...],
-        parent: Optional["RadixNode"] = None,
+        chunk_tokens: Tuple[int, ...],
+        parent: Optional["ChunkRadixNode"] = None,
         block_id: Optional[int] = None,
-        cached_position: Optional[int] = None,
-        continuation_tokens: Optional[List[int]] = None,
+        cached_position: int = 0,
     ) -> None:
-        self.token_subsequence = token_subsequence
+        self.chunk_tokens = chunk_tokens
         self.parent = parent
         self.block_id = block_id
         self.cached_position = cached_position
-        self.continuation_tokens: List[int] = continuation_tokens or []
-        # Children mapped by the first token of their sub-sequence
-        self.children: Dict[int, RadixNode] = {}
+        # Child nodes keyed by their chunk_tokens tuple for exact chunk matching
+        self.children: Dict[Tuple[int, ...], ChunkRadixNode] = {}
 
     @property
     def is_leaf(self) -> bool:
-        """True if the node has no children."""
         return len(self.children) == 0
 
-    @property
-    def is_block_terminator(self) -> bool:
-        """True if this node represents a complete cached KV chunk."""
-        return self.block_id is not None
 
+class ChunkRadixTree:
+    """Prefix tree mapping token chunk sequences to PinnedKVPool block_ids."""
 
-class RadixTree:
-    """Token-level Radix Tree supporting exact chunk matches and prefix queries."""
+    def __init__(self, chunk_size: int = 128) -> None:
+        """Initialize the chunk radix tree.
 
-    def __init__(self) -> None:
-        # Root node holds an empty token sequence
-        self.root = RadixNode(token_subsequence=())
-        # Reverse map for O(1) eviction: block_id -> RadixNode
-        self._block_to_node: Dict[int, RadixNode] = {}
-        self._total_nodes = 1
+        Args:
+            chunk_size: Token count per chunk block.
+        """
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+        self.chunk_size = chunk_size
+        self.root = ChunkRadixNode(chunk_tokens=())
+        # Reverse map for O(1) eviction: block_id -> set of ChunkRadixNode
+        self._block_to_nodes: Dict[int, List[ChunkRadixNode]] = {}
+        self._total_blocks = 0
 
     def __len__(self) -> int:
-        """Number of active cached blocks stored in the tree."""
-        return len(self._block_to_node)
+        """Number of active block references in the tree."""
+        return self._total_blocks
 
     def insert(
         self,
         token_ids: Sequence[int],
-        block_id: int,
-        cached_position: int,
-        continuation_tokens: Optional[List[int]] = None,
-    ) -> RadixNode:
-        """Insert a token sequence representing a cached chunk into the tree.
-
-        Handles edge splitting when a shared prefix already exists.
+        block_ids: Union[int, Sequence[int]],
+        cached_position: int = 0,
+    ) -> None:
+        """Insert token sequence mapped to block_ids along the prefix tree.
 
         Args:
-            token_ids: Full sequence of token IDs for the chunk.
-            block_id: Corresponding block index in the pinned pool.
-            cached_position: Original token position m when the key was rotated.
-            continuation_tokens: Optional continuation tokens for drafting.
-
-        Returns:
-            The terminal RadixNode storing the block.
+            token_ids: Full sequence of token IDs (length should be multiple of chunk_size).
+            block_ids: Single block_id (if len(token_ids) == chunk_size) or list of block_ids.
+            cached_position: Starting token position of the sequence.
         """
-        tokens = tuple(token_ids)
-        if not tokens:
-            raise ValueError("Cannot insert empty token sequence.")
+        tokens = list(token_ids)
+        if len(tokens) == 0:
+            return
 
-        curr_node = self.root
-        idx = 0
-        total_len = len(tokens)
+        if isinstance(block_ids, int):
+            b_ids = [block_ids]
+        else:
+            b_ids = list(block_ids)
 
-        while idx < total_len:
-            first_tok = tokens[idx]
-            if first_tok not in curr_node.children:
-                # No child branch exists; create new node with remaining tokens
-                new_node = RadixNode(
-                    token_subsequence=tokens[idx:],
-                    parent=curr_node,
-                    block_id=block_id,
-                    cached_position=cached_position,
-                    continuation_tokens=continuation_tokens,
-                )
-                curr_node.children[first_tok] = new_node
-                self._block_to_node[block_id] = new_node
-                self._total_nodes += 1
-                return new_node
-
-            child = curr_node.children[first_tok]
-            subseq = child.token_subsequence
-
-            # Calculate length of shared prefix
-            common_len = 0
-            while (
-                common_len < len(subseq)
-                and (idx + common_len) < total_len
-                and subseq[common_len] == tokens[idx + common_len]
-            ):
-                common_len += 1
-
-            if common_len < len(subseq):
-                # Split existing child edge at common_len
-                split_node = RadixNode(
-                    token_subsequence=subseq[:common_len],
-                    parent=curr_node,
-                    block_id=None,
-                    cached_position=None,
-                )
-                curr_node.children[first_tok] = split_node
-
-                # Update existing child to become child of split_node with truncated subsequence
-                child.token_subsequence = subseq[common_len:]
-                child.parent = split_node
-                split_node.children[child.token_subsequence[0]] = child
-
-                curr_node = split_node
-                self._total_nodes += 1
-                idx += common_len
-
-                # If all tokens consumed, split_node is our destination
-                if idx == total_len:
-                    split_node.block_id = block_id
-                    split_node.cached_position = cached_position
-                    split_node.continuation_tokens = continuation_tokens or []
-                    self._block_to_node[block_id] = split_node
-                    return split_node
-            else:
-                # Fully matched child edge; advance
-                curr_node = child
-                idx += len(subseq)
-
-        # Existing node matched exactly; update block metadata
-        curr_node.block_id = block_id
-        curr_node.cached_position = cached_position
-        curr_node.continuation_tokens = continuation_tokens or []
-        self._block_to_node[block_id] = curr_node
-        return curr_node
-
-    def match_exact(self, token_ids: Sequence[int]) -> Optional[RadixMatchResult]:
-        """Look up an exact token chunk in the Radix tree.
-
-        Returns:
-            RadixMatchResult if an exact cached block matches all token_ids, else None.
-        """
-        tokens = tuple(token_ids)
-        if not tokens:
-            return None
-
-        curr_node = self.root
-        idx = 0
-        total_len = len(tokens)
-
-        while idx < total_len:
-            first_tok = tokens[idx]
-            if first_tok not in curr_node.children:
-                return None
-
-            child = curr_node.children[first_tok]
-            subseq = child.token_subsequence
-            sub_len = len(subseq)
-
-            if total_len - idx < sub_len or tokens[idx : idx + sub_len] != subseq:
-                return None
-
-            curr_node = child
-            idx += sub_len
-
-        if curr_node.is_block_terminator and curr_node.block_id is not None:
-            return RadixMatchResult(
-                block_id=curr_node.block_id,
-                cached_position=curr_node.cached_position or 0,
-                token_ids=tokens,
-                matched_length=total_len,
-                continuation_tokens=curr_node.continuation_tokens,
+        num_chunks = len(tokens) // self.chunk_size
+        if num_chunks == 0:
+            raise ValueError(
+                f"token_ids length ({len(tokens)}) is less than chunk_size ({self.chunk_size})."
             )
-        return None
 
-    def match_prefix(self, token_ids: Sequence[int]) -> List[RadixMatchResult]:
-        """Greedily traverse and return all contiguous matching chunk blocks from the start."""
-        tokens = tuple(token_ids)
-        matches: List[RadixMatchResult] = []
-        if not tokens:
-            return matches
-
-        curr_node = self.root
-        idx = 0
-        total_len = len(tokens)
-
-        while idx < total_len:
-            first_tok = tokens[idx]
-            if first_tok not in curr_node.children:
-                break
-
-            child = curr_node.children[first_tok]
-            subseq = child.token_subsequence
-            sub_len = len(subseq)
-
-            if total_len - idx < sub_len or tokens[idx : idx + sub_len] != subseq:
-                break
-
-            curr_node = child
-            idx += sub_len
-
-            if curr_node.is_block_terminator and curr_node.block_id is not None:
-                matches.append(
-                    RadixMatchResult(
-                        block_id=curr_node.block_id,
-                        cached_position=curr_node.cached_position or 0,
-                        token_ids=tokens[:idx],
-                        matched_length=idx,
-                        continuation_tokens=curr_node.continuation_tokens,
-                    )
+        if len(b_ids) != num_chunks:
+            # If a single block_id was passed for 1 chunk, allow it
+            if len(b_ids) == 1 and num_chunks == 1:
+                pass
+            else:
+                raise ValueError(
+                    f"Number of block_ids ({len(b_ids)}) does not match chunk count ({num_chunks})."
                 )
+
+        curr = self.root
+        for c in range(num_chunks):
+            chunk_toks = tuple(tokens[c * self.chunk_size : (c + 1) * self.chunk_size])
+            bid = b_ids[c]
+            chunk_pos = cached_position + c * self.chunk_size
+
+            if chunk_toks in curr.children:
+                child = curr.children[chunk_toks]
+                # Update block_id if newly provided
+                if child.block_id != bid:
+                    child.block_id = bid
+                    child.cached_position = chunk_pos
+                    if bid not in self._block_to_nodes:
+                        self._block_to_nodes[bid] = []
+                    self._block_to_nodes[bid].append(child)
+                curr = child
+            else:
+                new_node = ChunkRadixNode(
+                    chunk_tokens=chunk_toks,
+                    parent=curr,
+                    block_id=bid,
+                    cached_position=chunk_pos,
+                )
+                curr.children[chunk_toks] = new_node
+                if bid not in self._block_to_nodes:
+                    self._block_to_nodes[bid] = []
+                self._block_to_nodes[bid].append(new_node)
+                self._total_blocks += 1
+                curr = new_node
+
+    def match_prefix(self, token_ids: Sequence[int]) -> List[Tuple[int, int]]:
+        """Match as many contiguous chunks as possible from the prefix of token_ids.
+
+        Args:
+            token_ids: Sequence of prompt token IDs.
+
+        Returns:
+            List of (chunk_idx, block_id) pairs for each matched chunk.
+        """
+        tokens = list(token_ids)
+        num_chunks = len(tokens) // self.chunk_size
+        matches: List[Tuple[int, int]] = []
+
+        curr = self.root
+        for c in range(num_chunks):
+            chunk_toks = tuple(tokens[c * self.chunk_size : (c + 1) * self.chunk_size])
+            if chunk_toks in curr.children:
+                child = curr.children[chunk_toks]
+                if child.block_id is not None:
+                    matches.append((c, child.block_id))
+                    curr = child
+                else:
+                    break
+            else:
+                break
 
         return matches
 
+    def match_exact(self, chunk_tokens: Sequence[int]) -> Optional[RadixMatchResult]:
+        """Look up a single exact chunk in the root's immediate children."""
+        toks = tuple(chunk_tokens)
+        if len(toks) != self.chunk_size:
+            return None
+
+        if toks in self.root.children:
+            node = self.root.children[toks]
+            if node.block_id is not None:
+                return RadixMatchResult(
+                    block_id=node.block_id,
+                    cached_position=node.cached_position,
+                    token_ids=toks,
+                    matched_length=self.chunk_size,
+                )
+        return None
+
     def evict_block(self, block_id: int) -> bool:
-        """Evict a block by block_id, pruning unneeded internal nodes in O(1).
+        """Evict all occurrences of block_id and prune empty leaf branches upward.
 
         Args:
             block_id: The ID of the block to evict.
 
         Returns:
-            True if the block was found and removed, False otherwise.
+            True if one or more nodes were evicted, False otherwise.
         """
-        if block_id not in self._block_to_node:
+        if block_id not in self._block_to_nodes:
             return False
 
-        node = self._block_to_node.pop(block_id)
-        node.block_id = None
-        node.cached_position = None
-        node.continuation_tokens = []
-
-        # If leaf, prune upward
-        if node.is_leaf and node.parent is not None:
+        nodes = self._block_to_nodes.pop(block_id)
+        for node in nodes:
+            node.block_id = None
+            self._total_blocks = max(0, self._total_blocks - 1)
+            # Prune upward if leaf
             self._prune_upward(node)
 
         return True
 
-    def _prune_upward(self, node: RadixNode) -> None:
+    def _prune_upward(self, node: ChunkRadixNode) -> None:
         """Recursively prune empty non-terminating leaves up to root."""
         curr = node
-        while curr.parent is not None and curr.is_leaf and not curr.is_block_terminator:
+        while curr.parent is not None and curr.is_leaf and curr.block_id is None:
             parent = curr.parent
-            first_tok = curr.token_subsequence[0]
-            if first_tok in parent.children:
-                del parent.children[first_tok]
-                self._total_nodes -= 1
+            if curr.chunk_tokens in parent.children:
+                del parent.children[curr.chunk_tokens]
             curr = parent
 
     def clear(self) -> None:
-        """Reset the Radix tree."""
-        self.root = RadixNode(token_subsequence=())
-        self._block_to_node.clear()
-        self._total_nodes = 1
+        """Reset the radix tree."""
+        self.root = ChunkRadixNode(chunk_tokens=())
+        self._block_to_nodes.clear()
+        self._total_blocks = 0
+
+
+# Backward compatibility aliases
+RadixTree = ChunkRadixTree
+RadixNode = ChunkRadixNode

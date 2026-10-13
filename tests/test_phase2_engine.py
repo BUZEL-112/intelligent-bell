@@ -1,11 +1,15 @@
 """Test suite for SpecCache Phase 2: Hybrid Radix-Semantic Engine and Pinned DMA.
 
 Verifies:
-1. PinnedHostPool allocation, chunk read/write, and LRU eviction recycling.
-2. RadixTree exact matching, common prefix edge splitting, and O(1) eviction pruning.
-3. SemanticIndex cosine threshold routing (DIRECT_REUSE, SPECULATIVE_DRAFT, CACHE_MISS).
-4. SpecCacheEngine two-tier hierarchical routing (Tier 1 Radix -> Tier 2 FAISS).
-5. Asynchronous dual-stream PCIe DMA pipeline parity against PyTorch eager reference.
+1. Exact Hit vs. Semantic Shifted Hit:
+   - Inserts chunk originally rotated at p_cached = 512.
+   - Queries with slightly perturbed embedding (cos_sim ~ 0.96) at p_target = 128 (Delta p = -384).
+   - Confirms engine routes via REUSE, transfers over DMA, shifts RoPE by -384 via
+     Phase 1 Triton kernel, and matches ground-truth FP16 rotated Key within 1e-2.
+2. LRU Eviction Integrity:
+   - Fills pool of max_blocks = 8, inserts 10 blocks, and verifies the 2 oldest blocks
+     are cleanly evicted and invalidated in both Radix Tree and Semantic Index.
+3. Unit tests for PinnedKVPool, ChunkRadixTree, and SemanticHNSWIndex.
 """
 
 from typing import List, Tuple
@@ -18,18 +22,18 @@ from speccache.cache.engine import (
     ChunkRoutingStatus,
     SpecCacheEngine,
 )
-from speccache.cache.pinned_pool import BlockMetadata, PinnedHostPool
-from speccache.cache.radix_index import RadixMatchResult, RadixTree
+from speccache.cache.pinned_pool import OriginalPositionMetadata, PinnedKVPool
+from speccache.cache.radix_index import ChunkRadixTree
 from speccache.cache.semantic_index import (
-    SemanticIndex,
-    SemanticLookupResult,
-    SemanticRoutingAction,
+    RouteDecision,
+    SemanticHNSWIndex,
 )
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
     dequant_value_ref,
     pytorch_eager_dequant_rope_shift,
     quantize_kv_int8,
+    rotate_half,
 )
 
 
@@ -50,273 +54,234 @@ def _generate_synthetic_chunk(
 
 
 # ==============================================================================
-# PinnedHostPool Tests
+# Requirement E.1: Exact Hit vs. Semantic Shifted Hit Test
 # ==============================================================================
 
-def test_pinned_pool_allocation_and_read_write():
-    """Verify writing to and reading from pinned host pool slots."""
-    chunk_size, heads, dim = 64, 4, 64
-    max_blocks = 4
-    pool = PinnedHostPool(max_blocks=max_blocks, chunk_size=chunk_size, num_kv_heads=heads, head_dim=dim)
-
-    assert pool.free_count == 4
-    assert pool.allocated_count == 0
-
-    k_q, k_s, v_q, v_s = _generate_synthetic_chunk(chunk_size, heads, dim, seed=1)
-    tokens = tuple(range(100, 100 + chunk_size))
-
-    block_id = pool.allocate(cached_position=0, token_ids=tokens)
-    assert block_id in range(max_blocks)
-    assert pool.allocated_count == 1
-    assert pool.free_count == 3
-
-    pool.write_chunk(block_id, k_q, k_s, v_q, v_s)
-
-    r_kq, r_ks, r_vq, r_vs = pool.read_chunk(block_id)
-    assert torch.equal(r_kq, k_q)
-    assert torch.equal(r_ks, k_s)
-    assert torch.equal(r_vq, v_q)
-    assert torch.equal(r_vs, v_s)
-
-
-def test_pinned_pool_lru_eviction():
-    """Verify that allocating beyond max_blocks evicts the least recently used block."""
-    chunk_size, heads, dim = 32, 2, 64
-    max_blocks = 3
-    evicted_ids: List[int] = []
-
-    def evict_cb(bid: int):
-        evicted_ids.append(bid)
-
-    pool = PinnedHostPool(
-        max_blocks=max_blocks,
-        chunk_size=chunk_size,
-        num_kv_heads=heads,
-        head_dim=dim,
-        on_evict_callback=evict_cb,
-    )
-
-    # Allocate 3 blocks to fill arena
-    b0 = pool.allocate(cached_position=0, token_ids=tuple(range(32)))
-    b1 = pool.allocate(cached_position=32, token_ids=tuple(range(32, 64)))
-    b2 = pool.allocate(cached_position=64, token_ids=tuple(range(64, 96)))
-
-    assert pool.allocated_count == 3
-    assert pool.free_count == 0
-
-    # Touch b0 so b1 becomes the LRU block
-    pool.touch(b0)
-
-    # Allocating a 4th block must evict b1
-    b3 = pool.allocate(cached_position=96, token_ids=tuple(range(96, 128)))
-    assert len(evicted_ids) == 1
-    assert evicted_ids[0] == b1
-    assert b3 == b1  # Recycles the evicted block slot
-    assert pool.allocated_count == 3
-
-
-# ==============================================================================
-# RadixTree Tests
-# ==============================================================================
-
-def test_radix_tree_exact_match_and_split():
-    """Verify exact token sequence matching and edge splitting on shared prefixes."""
-    tree = RadixTree()
-
-    # Sequence A: [10, 11, 12, 13]
-    tree.insert(token_ids=[10, 11, 12, 13], block_id=1, cached_position=0)
-
-    # Sequence B: [10, 11, 20, 21] (shares prefix [10, 11])
-    tree.insert(token_ids=[10, 11, 20, 21], block_id=2, cached_position=100)
-
-    # Look up Sequence A
-    match_a = tree.match_exact([10, 11, 12, 13])
-    assert match_a is not None
-    assert match_a.block_id == 1
-    assert match_a.cached_position == 0
-
-    # Look up Sequence B
-    match_b = tree.match_exact([10, 11, 20, 21])
-    assert match_b is not None
-    assert match_b.block_id == 2
-    assert match_b.cached_position == 100
-
-    # Look up non-existent sequence
-    assert tree.match_exact([10, 11, 99]) is None
-
-
-def test_radix_tree_eviction():
-    """Verify O(1) eviction removes a block and prunes the tree."""
-    tree = RadixTree()
-    tree.insert(token_ids=[1, 2, 3], block_id=10, cached_position=0)
-    assert len(tree) == 1
-    assert tree.match_exact([1, 2, 3]) is not None
-
-    # Evict block 10
-    assert tree.evict_block(10) is True
-    assert len(tree) == 0
-    assert tree.match_exact([1, 2, 3]) is None
-
-
-# ==============================================================================
-# SemanticIndex Tests
-# ==============================================================================
-
-@pytest.mark.parametrize("force_fallback", [False, True])
-def test_semantic_index_threshold_routing(force_fallback: bool):
-    """Test 3-way routing: DIRECT_REUSE (>=0.92), SPECULATIVE_DRAFT ([0.80, 0.92)), CACHE_MISS (<0.80)."""
-    dim = 64
-    index = SemanticIndex(
-        embedding_dim=dim,
-        tau_reuse=0.92,
-        tau_spec=0.80,
-        force_fallback=force_fallback,
-    )
-
-    base_vec = np.zeros(dim, dtype=np.float32)
-    base_vec[0] = 1.0  # Unit vector along axis 0
-
-    index.add(
-        embedding=base_vec,
-        block_id=5,
-        cached_position=128,
-        token_ids=[1, 2, 3],
-        continuation_tokens=[4, 5],
-    )
-
-    # 1. Near-identical query vector (similarity ~0.99 >= 0.92) -> DIRECT_REUSE
-    reuse_query = np.copy(base_vec)
-    reuse_query[1] = 0.05
-    res_reuse = index.search(reuse_query)
-    assert res_reuse.action == SemanticRoutingAction.DIRECT_REUSE
-    assert res_reuse.block_id == 5
-    assert res_reuse.similarity >= 0.92
-
-    # 2. Moderately similar query vector (similarity ~0.85 in [0.80, 0.92)) -> SPECULATIVE_DRAFT
-    # An angle of ~30 degrees has cos(30 deg) ~ 0.866
-    draft_query = np.zeros(dim, dtype=np.float32)
-    draft_query[0] = 0.866
-    draft_query[1] = 0.5
-    res_draft = index.search(draft_query)
-    assert res_draft.action == SemanticRoutingAction.SPECULATIVE_DRAFT
-    assert res_draft.block_id == 5
-    assert 0.80 <= res_draft.similarity < 0.92
-    assert res_draft.continuation_tokens == [4, 5]
-
-    # 3. Orthogonal query vector (similarity 0.0 < 0.80) -> CACHE_MISS
-    miss_query = np.zeros(dim, dtype=np.float32)
-    miss_query[10] = 1.0
-    res_miss = index.search(miss_query)
-    assert res_miss.action == SemanticRoutingAction.CACHE_MISS
-    assert res_miss.similarity < 0.80
-
-
-# ==============================================================================
-# SpecCacheEngine End-to-End Hierarchical Routing & Eviction Tests
-# ==============================================================================
-
-def test_engine_two_tier_lookup_and_eviction_cascade():
-    """Verify Radix Tier 1 exact match priority, Semantic Tier 2 fallback, and eviction cascade."""
-    chunk_size = 64
-    heads, dim = 4, 64
-    emb_dim = 32
+def test_exact_hit_vs_semantic_shifted_hit():
+    """Verify exact hit and semantic shifted hit with relative RoPE phase shift of -384."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    chunk_size = 128
+    heads = 8
+    head_dim = 128
+    embed_dim = 64
 
     engine = SpecCacheEngine(
         chunk_size=chunk_size,
         num_kv_heads=heads,
-        head_dim=dim,
-        max_blocks=2,  # Small pool to force eviction
-        embedding_dim=emb_dim,
+        head_dim=head_dim,
+        max_blocks=16,
+        embedding_dim=embed_dim,
+        device=device,
+        force_fallback_semantic=True,  # Ensure consistent CPU/GPU test behavior
+    )
+
+    # 1. Generate raw FP16 keys and rotate at original position p_cached = 512
+    torch.manual_seed(1234)
+    raw_k = torch.randn((chunk_size, heads, head_dim), dtype=torch.float32, device=device)
+    raw_v = torch.randn((chunk_size, heads, head_dim), dtype=torch.float32, device=device)
+
+    p_cached = 512
+    cos_512, sin_512 = compute_rope_cos_sin_delta(
+        torch.tensor([p_cached], device=device), head_dim, device=device
+    )
+    cos_512_full = torch.cat([cos_512, cos_512], dim=-1)[:, None, :]
+    sin_512_full = torch.cat([sin_512, sin_512], dim=-1)[:, None, :]
+
+    # Keys rotated at position 512
+    k_rot_512 = (raw_k * cos_512_full + rotate_half(raw_k) * sin_512_full).to(torch.float16)
+
+    # Quantize to INT8
+    k_quant, k_scale = quantize_kv_int8(k_rot_512)
+    v_quant, v_scale = quantize_kv_int8(raw_v)
+
+    # Base semantic embedding
+    base_emb = np.zeros(embed_dim, dtype=np.float32)
+    base_emb[0] = 1.0  # Unit vector along axis 0
+
+    chunk_tokens = list(range(1000, 1000 + chunk_size))
+
+    # Register chunk at original position p_cached = 512
+    block_id = engine.register_chunk(
+        token_ids=chunk_tokens,
+        cached_position=p_cached,
+        k_quant=k_quant.cpu(),
+        k_scale=k_scale.cpu(),
+        v_quant=v_quant.cpu(),
+        v_scale=v_scale.cpu(),
+        embedding=base_emb,
+    )
+
+    # 2. Test Semantic Shifted Hit at target position p_target = 128 (Delta p = 128 - 512 = -384)
+    p_target = 128
+    expected_delta_p = p_target - p_cached  # -384
+
+    # Create perturbed embedding with cos_sim ~ 0.96 (angle ~16.26 degrees: cos(16.26 deg) ~ 0.96)
+    perturbed_emb = np.copy(base_emb)
+    perturbed_emb[1] = 0.29  # 1.0 / sqrt(1 + 0.29^2) = 1.0 / 1.041 ~ 0.960
+    norm_sim = float(np.dot(perturbed_emb / np.linalg.norm(perturbed_emb), base_emb))
+    assert 0.94 <= norm_sim <= 0.98
+
+    # Query with novel tokens (to miss Tier 1 Radix) and perturbed embedding (to hit Tier 2 Semantic)
+    novel_tokens = list(range(5000, 5000 + chunk_size))
+    k_out, v_out, decisions = engine.retrieve_and_reconstruct_kv(
+        chunks_tokens=[novel_tokens],
+        chunks_embeddings=[perturbed_emb],
+        target_positions=[p_target],
+    )
+
+    assert len(decisions) == 1
+    dec = decisions[0]
+
+    # Verify decision routed via SEMANTIC_REUSE with Delta p = -384
+    assert dec.status == ChunkRoutingStatus.SEMANTIC_REUSE
+    assert dec.block_id == block_id
+    assert dec.cached_position == p_cached
+    assert dec.delta_p == expected_delta_p
+
+    # Ground truth reference: Rotate k_quant by Delta p = -384 using reference implementation
+    cos_neg384, sin_neg384 = compute_rope_cos_sin_delta(
+        torch.tensor([expected_delta_p], device=device), head_dim, device=device
+    )
+    k_ref = pytorch_eager_dequant_rope_shift(
+        k_quant.to(device), k_scale.to(device), cos_neg384, sin_neg384
+    )
+
+    # Verify numerical match within 1e-2
+    torch.testing.assert_close(k_out, k_ref, atol=1e-2, rtol=1e-2)
+
+
+# ==============================================================================
+# Requirement E.2: LRU Eviction Integrity Test
+# ==============================================================================
+
+def test_lru_eviction_integrity():
+    """Fill pool of max_blocks = 8, insert 10 blocks, verify oldest 2 evicted and invalidated."""
+    max_blocks = 8
+    chunk_size = 64
+    heads = 4
+    head_dim = 64
+    embed_dim = 32
+
+    engine = SpecCacheEngine(
+        chunk_size=chunk_size,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        max_blocks=max_blocks,
+        embedding_dim=embed_dim,
         force_fallback_semantic=True,
     )
 
-    # Register Chunk 0
-    toks0 = list(range(100, 100 + chunk_size))
-    kq0, ks0, vq0, vs0 = _generate_synthetic_chunk(chunk_size, heads, dim, seed=10)
-    emb0 = np.zeros(emb_dim, dtype=np.float32)
-    emb0[0] = 1.0
-    b0 = engine.register_chunk(toks0, cached_position=0, k_quant=kq0, k_scale=ks0, v_quant=vq0, v_scale=vs0, embedding=emb0)
+    registered_tokens: List[List[int]] = []
+    registered_embs: List[np.ndarray] = []
 
-    # Register Chunk 1
-    toks1 = list(range(200, 200 + chunk_size))
-    kq1, ks1, vq1, vs1 = _generate_synthetic_chunk(chunk_size, heads, dim, seed=20)
-    emb1 = np.zeros(emb_dim, dtype=np.float32)
-    emb1[1] = 1.0
-    b1 = engine.register_chunk(toks1, cached_position=64, k_quant=kq1, k_scale=ks1, v_quant=vq1, v_scale=vs1, embedding=emb1)
+    # Insert 10 blocks into pool with capacity 8
+    for i in range(10):
+        toks = list(range(i * 1000, i * 1000 + chunk_size))
+        registered_tokens.append(toks)
 
-    # 1. Query with exact tokens for Chunk 0 at new prompt position 128 (Delta p = 128 - 0 = +128)
-    decisions = engine.lookup_chunks(prompt_tokens=toks0)
-    assert len(decisions) == 1
-    assert decisions[0].status == ChunkRoutingStatus.EXACT_REUSE
-    assert decisions[0].block_id == b0
-    assert decisions[0].delta_p == 0  # target_start_pos=0, cached_pos=0
+        emb = np.zeros(embed_dim, dtype=np.float32)
+        emb[i % embed_dim] = 1.0
+        registered_embs.append(emb)
 
-    # 2. Register Chunk 2 -> Forces eviction of LRU block (b0 was touched, so b1 is evicted!)
-    toks2 = list(range(300, 300 + chunk_size))
-    kq2, ks2, vq2, vs2 = _generate_synthetic_chunk(chunk_size, heads, dim, seed=30)
-    emb2 = np.zeros(emb_dim, dtype=np.float32)
-    emb2[2] = 1.0
-    b2 = engine.register_chunk(toks2, cached_position=128, k_quant=kq2, k_scale=ks2, v_quant=vq2, v_scale=vs2, embedding=emb2)
+        kq, ks, vq, vs = _generate_synthetic_chunk(chunk_size, heads, head_dim, seed=i)
+        engine.register_chunk(
+            token_ids=toks,
+            cached_position=i * 64,
+            k_quant=kq,
+            k_scale=ks,
+            v_quant=vq,
+            v_scale=vs,
+            embedding=emb,
+        )
 
-    # Chunk 1 was evicted from pinned pool -> Must now be a CACHE_MISS in Radix and Semantic indices!
-    decisions_evicted = engine.lookup_chunks(prompt_tokens=toks1, chunk_embeddings=[emb1])
-    assert decisions_evicted[0].status == ChunkRoutingStatus.CACHE_MISS
+    # The pool capacity is 8, so exactly 8 blocks must be active
+    assert engine.pool.allocated_count == max_blocks
+
+    # Blocks 0 and 1 are the oldest and must have been evicted
+    # 1. Test Radix Tree invalidation: chunks 0 and 1 must NOT match
+    assert engine.radix_tree.match_exact(registered_tokens[0]) is None
+    assert engine.radix_tree.match_exact(registered_tokens[1]) is None
+
+    # 2. Test Semantic Index invalidation: query with embeddings 0 and 1 must return MISS
+    decision0, sim0, bid0, _ = engine.semantic_index.query(registered_embs[0])
+    assert decision0 == RouteDecision.MISS
+
+    decision1, sim1, bid1, _ = engine.semantic_index.query(registered_embs[1])
+    assert decision1 == RouteDecision.MISS
+
+    # 3. Blocks 2 through 9 must remain active and valid in Radix Tree
+    for i in range(2, 10):
+        match = engine.radix_tree.match_exact(registered_tokens[i])
+        assert match is not None
+        assert match.block_id in range(max_blocks)
 
 
 # ==============================================================================
-# Async DMA Pipeline Numerical Parity Test
+# PinnedKVPool Unit Tests
 # ==============================================================================
 
-def test_async_dma_pipeline_parity():
-    """Verify that pipelined double-buffered async DMA matches synchronous reference."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def test_pinned_kv_pool_basic_operations():
+    """Verify allocate, write_block, get_block_views, touch, and free in PinnedKVPool."""
+    max_blocks = 4
     chunk_size = 64
-    heads, dim = 8, 128
-    emb_dim = 64
+    heads = 4
+    head_dim = 64
 
-    engine = SpecCacheEngine(
-        chunk_size=chunk_size,
-        num_kv_heads=heads,
-        head_dim=dim,
-        max_blocks=8,
-        embedding_dim=emb_dim,
-        device=device,
-    )
+    pool = PinnedKVPool(max_blocks=max_blocks, chunk_size=chunk_size, num_heads=heads, head_dim=head_dim)
+    assert pool.free_count == max_blocks
+    assert pool.allocated_count == 0
 
-    num_chunks = 4
-    all_tokens: List[int] = []
-    chunk_data = []
+    # Allocate a slot
+    bid = pool.allocate()
+    assert bid in range(max_blocks)
+    assert pool.allocated_count == 1
+    assert pool.free_count == max_blocks - 1
 
-    for c in range(num_chunks):
-        toks = list(range(c * 1000, c * 1000 + chunk_size))
-        all_tokens.extend(toks)
-        kq, ks, vq, vs = _generate_synthetic_chunk(chunk_size, heads, dim, seed=100 + c)
-        bid = engine.register_chunk(toks, cached_position=c * 64, k_quant=kq, k_scale=ks, v_quant=vq, v_scale=vs)
-        chunk_data.append((bid, kq, ks, vq, vs))
+    # Write data
+    kq, ks, vq, vs = _generate_synthetic_chunk(chunk_size, heads, head_dim, seed=42)
+    pool.write_block(bid, kq, ks, vq, vs, start_pos=256)
 
-    # Query all 4 chunks
-    decisions = engine.lookup_chunks(prompt_tokens=all_tokens)
-    assert len(decisions) == 4
-    for d in decisions:
-        assert d.status == ChunkRoutingStatus.EXACT_REUSE
+    assert pool.get_start_pos(bid) == 256
 
-    # Execute async DMA pipeline
-    k_out_pipelined, v_out_pipelined = engine.execute_async_dma_and_rope(decisions)
+    # Read views
+    r_kq, r_ks, r_vq, r_vs = pool.get_block_views(bid)
+    assert torch.equal(r_kq, kq)
+    assert torch.equal(r_ks, ks)
+    assert torch.equal(r_vq, vq)
+    assert torch.equal(r_vs, vs)
 
-    assert k_out_pipelined.shape == (num_chunks * chunk_size, heads, dim)
-    assert v_out_pipelined.shape == (num_chunks * chunk_size, heads, dim)
+    # Free
+    pool.free(bid)
+    assert pool.allocated_count == 0
+    assert pool.free_count == max_blocks
 
-    # Compute reference ground truth sequentially
-    for i, dec in enumerate(decisions):
-        bid, kq, ks, vq, vs = chunk_data[i]
-        delta_p = dec.delta_p
-        cos_d, sin_d = compute_rope_cos_sin_delta(torch.tensor([delta_p], device=device), dim, device=device)
 
-        k_ref = pytorch_eager_dequant_rope_shift(kq.to(device), ks.to(device), cos_d, sin_d)
-        v_ref = dequant_value_ref(vq.to(device), vs.to(device))
+# ==============================================================================
+# ChunkRadixTree Unit Tests
+# ==============================================================================
 
-        k_slice = k_out_pipelined[i * chunk_size : (i + 1) * chunk_size]
-        v_slice = v_out_pipelined[i * chunk_size : (i + 1) * chunk_size]
+def test_chunk_radix_tree_prefix_matching():
+    """Verify ChunkRadixTree match_prefix returns list of (chunk_idx, block_id)."""
+    chunk_size = 32
+    tree = ChunkRadixTree(chunk_size=chunk_size)
 
-        torch.testing.assert_close(k_slice, k_ref, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(v_slice, v_ref, atol=1e-2, rtol=1e-2)
+    # Sequence of 3 chunks: total 96 tokens
+    chunk0 = list(range(0, 32))
+    chunk1 = list(range(32, 64))
+    chunk2 = list(range(64, 96))
+    full_seq = chunk0 + chunk1 + chunk2
+
+    tree.insert(token_ids=full_seq, block_ids=[10, 20, 30])
+
+    # Query full sequence: matches all 3 chunks
+    matches = tree.match_prefix(full_seq)
+    assert matches == [(0, 10), (1, 20), (2, 30)]
+
+    # Query prefix sequence (first 2 chunks): matches 2 chunks
+    matches_sub = tree.match_prefix(chunk0 + chunk1)
+    assert matches_sub == [(0, 10), (1, 20)]
+
+    # Query partial mismatch at chunk 1: only chunk 0 matches
+    mismatch_seq = chunk0 + [999] * 32
+    matches_mismatch = tree.match_prefix(mismatch_seq)
+    assert matches_mismatch == [(0, 10)]

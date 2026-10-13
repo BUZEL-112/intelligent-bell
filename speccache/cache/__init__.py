@@ -5,10 +5,23 @@ from speccache.cache.engine import (
     ChunkRoutingStatus,
     SpecCacheEngine,
 )
-from speccache.cache.pinned_pool import BlockMetadata, PinnedHostPool
-from speccache.cache.radix_index import RadixMatchResult, RadixNode, RadixTree
+from speccache.cache.pinned_pool import (
+    BlockMetadata,
+    OriginalPositionMetadata,
+    PinnedHostPool,
+    PinnedKVPool,
+)
+from speccache.cache.radix_index import (
+    ChunkRadixNode,
+    ChunkRadixTree,
+    RadixMatchResult,
+    RadixNode,
+    RadixTree,
+)
 from speccache.cache.semantic_index import (
     FAISS_AVAILABLE,
+    RouteDecision,
+    SemanticHNSWIndex,
     SemanticIndex,
     SemanticLookupResult,
     SemanticRoutingAction,
@@ -16,13 +29,19 @@ from speccache.cache.semantic_index import (
 
 __all__ = [
     "BlockMetadata",
+    "ChunkRadixNode",
+    "ChunkRadixTree",
     "ChunkRoutingDecision",
     "ChunkRoutingStatus",
     "FAISS_AVAILABLE",
+    "OriginalPositionMetadata",
     "PinnedHostPool",
+    "PinnedKVPool",
     "RadixMatchResult",
     "RadixNode",
     "RadixTree",
+    "RouteDecision",
+    "SemanticHNSWIndex",
     "SemanticIndex",
     "SemanticLookupResult",
     "SemanticRoutingAction",

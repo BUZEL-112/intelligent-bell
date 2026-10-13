@@ -19,7 +19,7 @@ bench-phase1:
 	python benchmarks/bench_roofline.py --output-plot benchmarks/phase1_roofline.png
 
 bench-phase2:
-	python benchmarks/bench_phase2_dma.py --output-plot benchmarks/phase2_dma_overlap.png
+	python benchmarks/bench_phase2_dma.py --output-plot benchmarks/phase2_dma_pipeline.png
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
