@@ -77,23 +77,42 @@ def benchmark_baseline1_fp16_pageable(
 ) -> float:
     """Benchmark uncompressed FP16 KV transfer from pageable CPU RAM + Eager PyTorch RoPE."""
     torch.manual_seed(42)
-    k_fp16_pageable = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.float16, device="cpu")
-    v_fp16_pageable = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.float16, device="cpu")
+    num_chunks = num_tokens // chunk_size
+    k_fp16_chunks = [
+        torch.randn((chunk_size, num_heads, head_dim), dtype=torch.float16, device="cpu")
+        for _ in range(num_chunks)
+    ]
+    v_fp16_chunks = [
+        torch.randn((chunk_size, num_heads, head_dim), dtype=torch.float16, device="cpu")
+        for _ in range(num_chunks)
+    ]
 
-    delta_pos = torch.tensor([64], device=device)
-    cos_d, sin_d = compute_rope_cos_sin_delta(delta_pos, head_dim, device=device)
-    cos_full = torch.cat([cos_d, cos_d], dim=-1)[:, None, :].to(torch.float32)
-    sin_full = torch.cat([sin_d, sin_d], dim=-1)[:, None, :].to(torch.float32)
+    out_k = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
+    out_v = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
+
+    # Pre-allocated GPU staging buffers (zero cudaMalloc inside timing loop)
+    stage_k = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device)
+    stage_v = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device)
+
+    delta_positions = torch.tensor([c * 64 for c in range(num_chunks)], dtype=torch.float32, device=device)
+    cos_all, sin_all = compute_rope_cos_sin_delta(delta_positions, head_dim, device=device)
 
     def run_iter():
-        # Synchronous blocking transfer of uncompressed FP16 tensors
-        k_gpu = k_fp16_pageable.to(device, non_blocking=False)
-        v_gpu = v_fp16_pageable.to(device, non_blocking=False)
+        for i in range(num_chunks):
+            offset = i * chunk_size
+            stage_k.copy_(k_fp16_chunks[i], non_blocking=False)
+            stage_v.copy_(v_fp16_chunks[i], non_blocking=False)
 
-        # Eager PyTorch RoPE shift
-        k_f32 = k_gpu.to(torch.float32)
-        k_rot = (k_f32 * cos_full + rotate_half(k_f32) * sin_full).to(torch.float16)
-        _ = v_gpu
+            cos_i = cos_all[i : i + 1]
+            sin_i = sin_all[i : i + 1]
+            cos_full = torch.cat([cos_i, cos_i], dim=-1)[:, None, :].to(torch.float32)
+            sin_full = torch.cat([sin_i, sin_i], dim=-1)[:, None, :].to(torch.float32)
+
+            k_f32 = stage_k.to(torch.float32)
+            k_rot = (k_f32 * cos_full + rotate_half(k_f32) * sin_full).to(torch.float16)
+
+            out_k[offset : offset + chunk_size].copy_(k_rot)
+            out_v[offset : offset + chunk_size].copy_(stage_v)
         torch.cuda.synchronize(device)
 
     for _ in range(warmup):
@@ -126,25 +145,53 @@ def benchmark_baseline2_int8_pageable(
 ) -> float:
     """Benchmark INT8 KV from pageable CPU RAM + Phase 1 Triton kernel sequentially."""
     torch.manual_seed(42)
-    raw_k = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.float32, device="cpu")
-    raw_v = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.float32, device="cpu")
-    k_q_pageable, k_s_pageable = quantize_kv_int8(raw_k)
-    v_q_pageable, v_s_pageable = quantize_kv_int8(raw_v)
+    num_chunks = num_tokens // chunk_size
+    kq_chunks = []
+    ks_chunks = []
+    vq_chunks = []
+    vs_chunks = []
+    for _ in range(num_chunks):
+        raw_k = torch.randn((chunk_size, num_heads, head_dim), dtype=torch.float32, device="cpu")
+        raw_v = torch.randn((chunk_size, num_heads, head_dim), dtype=torch.float32, device="cpu")
+        kq, ks = quantize_kv_int8(raw_k)
+        vq, vs = quantize_kv_int8(raw_v)
+        kq_chunks.append(kq)
+        ks_chunks.append(ks)
+        vq_chunks.append(vq)
+        vs_chunks.append(vs)
 
     out_k = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
     out_v = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
 
-    delta_pos = torch.tensor([64], device=device)
-    cos_d, sin_d = compute_rope_cos_sin_delta(delta_pos, head_dim, device=device)
+    # Pre-allocated GPU staging buffers (zero cudaMalloc inside timing loop)
+    stage_kq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
+    stage_ks = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
+    stage_vq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
+    stage_vs = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
+
+    delta_positions = torch.tensor([c * 64 for c in range(num_chunks)], dtype=torch.float32, device=device)
+    cos_all, sin_all = compute_rope_cos_sin_delta(delta_positions, head_dim, device=device)
 
     def run_iter():
-        kq_gpu = k_q_pageable.to(device, non_blocking=False)
-        ks_gpu = k_s_pageable.to(device, non_blocking=False)
-        vq_gpu = v_q_pageable.to(device, non_blocking=False)
-        vs_gpu = v_s_pageable.to(device, non_blocking=False)
+        for i in range(num_chunks):
+            offset = i * chunk_size
+            stage_kq.copy_(kq_chunks[i], non_blocking=False)
+            stage_ks.copy_(ks_chunks[i], non_blocking=False)
+            stage_vq.copy_(vq_chunks[i], non_blocking=False)
+            stage_vs.copy_(vs_chunks[i], non_blocking=False)
 
-        triton_fused_k_dequant_rope_shift(kq_gpu, ks_gpu, cos_d, sin_d, out=out_k)
-        dequant_value(vq_gpu, vs_gpu, out=out_v)
+            triton_fused_k_dequant_rope_shift(
+                stage_kq,
+                stage_ks,
+                cos_all[i : i + 1],
+                sin_all[i : i + 1],
+                out=out_k[offset : offset + chunk_size],
+            )
+            dequant_value(
+                stage_vq,
+                stage_vs,
+                out=out_v[offset : offset + chunk_size],
+            )
         torch.cuda.synchronize(device)
 
     for _ in range(warmup):
@@ -178,28 +225,40 @@ def benchmark_baseline3_int8_pinned_sync(
 ) -> float:
     """Benchmark INT8 KV from pin_memory=True pool + Phase 1 Triton kernel sequentially."""
     chunk_size = engine.chunk_size
+    num_chunks = len(decisions)
     out_k = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
     out_v = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
+
+    # Pre-allocated GPU staging buffers (zero cudaMalloc inside timing loop)
+    stage_kq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
+    stage_ks = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
+    stage_vq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
+    stage_vs = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
+
+    delta_positions = torch.tensor([d.delta_p for d in decisions], dtype=torch.float32, device=device)
+    cos_all, sin_all = compute_rope_cos_sin_delta(delta_positions, head_dim, device=device)
 
     def run_iter():
         for i, dec in enumerate(decisions):
             offset = i * chunk_size
             kq_h, ks_h, vq_h, vs_h = engine.pool.get_block_views(dec.block_id)
 
-            kq_dev = kq_h.to(device, non_blocking=False)
-            ks_dev = ks_h.to(device, non_blocking=False)
-            vq_dev = vq_h.to(device, non_blocking=False)
-            vs_dev = vs_h.to(device, non_blocking=False)
-
-            cos_d, sin_d = compute_rope_cos_sin_delta(
-                torch.tensor([dec.delta_p], device=device), head_dim, device=device
-            )
+            stage_kq.copy_(kq_h, non_blocking=False)
+            stage_ks.copy_(ks_h, non_blocking=False)
+            stage_vq.copy_(vq_h, non_blocking=False)
+            stage_vs.copy_(vs_h, non_blocking=False)
 
             triton_fused_k_dequant_rope_shift(
-                kq_dev, ks_dev, cos_d, sin_d, out=out_k[offset : offset + chunk_size]
+                stage_kq,
+                stage_ks,
+                cos_all[i : i + 1],
+                sin_all[i : i + 1],
+                out=out_k[offset : offset + chunk_size],
             )
             dequant_value(
-                vq_dev, vs_dev, out=out_v[offset : offset + chunk_size]
+                stage_vq,
+                stage_vs,
+                out=out_v[offset : offset + chunk_size],
             )
         torch.cuda.synchronize(device)
 

@@ -119,14 +119,34 @@ class SpecCacheEngine:
             force_fallback=force_fallback_semantic,
         )
 
-        # 4. Asynchronous Transfer Streams (when CUDA is active)
+        # 4. Asynchronous Transfer Streams and Double-Buffered Staging Slabs
         self._is_cuda = self.device.type == "cuda" and torch.cuda.is_available()
         if self._is_cuda:
             self.transfer_stream = torch.cuda.Stream(device=self.device)
             self.compute_stream = torch.cuda.Stream(device=self.device)
+            self._stage_k_quant = [
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+            ]
+            self._stage_k_scale = [
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+            ]
+            self._stage_v_quant = [
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+            ]
+            self._stage_v_scale = [
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+            ]
         else:
             self.transfer_stream = None
             self.compute_stream = None
+            self._stage_k_quant = None
+            self._stage_k_scale = None
+            self._stage_v_quant = None
+            self._stage_v_scale = None
 
     def _handle_lru_eviction(self, block_id: int) -> None:
         """Cascade eviction from pinned pool down into Radix and Semantic indices."""
@@ -378,89 +398,100 @@ class SpecCacheEngine:
         if not self._is_cuda or not TRITON_AVAILABLE:
             return self._execute_cpu_fallback(valid_chunks, dest_k_out, dest_v_out)
 
-        # ----------------------------------------------------------------------
-        # Double-Buffered GPU Staging Buffers for Overlapped DMA + Compute
-        # ----------------------------------------------------------------------
-        stage_k_quant = [
-            torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-            torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-        ]
-        stage_k_scale = [
-            torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-            torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-        ]
-        stage_v_quant = [
-            torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-            torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-        ]
-        stage_v_scale = [
-            torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-            torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-        ]
-
-        transfer_events = [torch.cuda.Event(), torch.cuda.Event()]
-        compute_events = [torch.cuda.Event(), torch.cuda.Event()]
-
         num_chunks = len(valid_chunks)
 
-        def initiate_dma(chunk_idx: int, slot: int):
-            meta = valid_chunks[chunk_idx]
-            assert meta.block_id is not None
-            k_q_host, k_s_host, v_q_host, v_s_host = self.pool.get_block_views(meta.block_id)
+        # Ensure staging buffers are initialized and match current geometry
+        if (
+            self._stage_k_quant is None
+            or self._stage_k_quant[0].shape != (self.chunk_size, self.num_kv_heads, self.head_dim)
+        ):
+            self._stage_k_quant = [
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+            ]
+            self._stage_k_scale = [
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+            ]
+            self._stage_v_quant = [
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+            ]
+            self._stage_v_scale = [
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+            ]
 
-            with torch.cuda.stream(self.transfer_stream):
-                if chunk_idx >= 2:
-                    self.transfer_stream.wait_event(compute_events[slot])
+        # Precompute RoPE cos/sin factor tables for all chunks in a single GPU operation
+        delta_positions = torch.tensor(
+            [d.delta_p for d in valid_chunks],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        cos_all, sin_all = compute_rope_cos_sin_delta(
+            delta_positions, self.head_dim, device=self.device
+        )
 
-                stage_k_quant[slot].copy_(k_q_host, non_blocking=True)
-                stage_k_scale[slot].copy_(k_s_host, non_blocking=True)
-                stage_v_quant[slot].copy_(v_q_host, non_blocking=True)
-                stage_v_scale[slot].copy_(v_s_host, non_blocking=True)
-
-                transfer_events[slot].record(self.transfer_stream)
-
-        def execute_kernel(chunk_idx: int, slot: int):
-            meta = valid_chunks[chunk_idx]
-            out_offset = chunk_idx * self.chunk_size
-
-            with torch.cuda.stream(self.compute_stream):
-                self.compute_stream.wait_event(transfer_events[slot])
-
-                k_dest_slice = dest_k_out[out_offset : out_offset + self.chunk_size]
-                v_dest_slice = dest_v_out[out_offset : out_offset + self.chunk_size]
-
-                delta_pos = torch.tensor([meta.delta_p], device=self.device)
-                cos_delta, sin_delta = compute_rope_cos_sin_delta(
-                    delta_pos, self.head_dim, device=self.device
-                )
-
-                triton_fused_k_dequant_rope_shift(
-                    stage_k_quant[slot],
-                    stage_k_scale[slot],
-                    cos_delta,
-                    sin_delta,
-                    out=k_dest_slice,
-                )
-                dequant_value(
-                    stage_v_quant[slot],
-                    stage_v_scale[slot],
-                    out=v_dest_slice,
-                )
-
-                compute_events[slot].record(self.compute_stream)
+        # Allocate per-chunk synchronization events (zero-CPU-wait stream-level coordination)
+        transfer_events = [torch.cuda.Event() for _ in range(num_chunks)]
+        compute_events = [torch.cuda.Event() for _ in range(num_chunks)]
 
         # Prime first chunk into slot 0
-        initiate_dma(0, slot=0)
+        kq_0, ks_0, vq_0, vs_0 = self.pool.get_block_views(valid_chunks[0].block_id)
+        with torch.cuda.stream(self.transfer_stream):
+            self._stage_k_quant[0].copy_(kq_0, non_blocking=True)
+            self._stage_k_scale[0].copy_(ks_0, non_blocking=True)
+            self._stage_v_quant[0].copy_(vq_0, non_blocking=True)
+            self._stage_v_scale[0].copy_(vs_0, non_blocking=True)
+            transfer_events[0].record(self.transfer_stream)
 
+        # Pipelined loop: host dispatches non-blocking DMA and compute without any CPU waits
         for i in range(num_chunks):
             curr_slot = i % 2
             next_slot = (i + 1) % 2
 
+            # Stream 1: Transfer chunk (i + 1) while chunk (i) is computed
             if i + 1 < num_chunks:
-                initiate_dma(i + 1, slot=next_slot)
+                next_meta = valid_chunks[i + 1]
+                assert next_meta.block_id is not None
+                next_kq, next_ks, next_vq, next_vs = self.pool.get_block_views(next_meta.block_id)
 
-            execute_kernel(i, slot=curr_slot)
+                with torch.cuda.stream(self.transfer_stream):
+                    # If this staging slot was used by chunk (i - 1), wait on GPU for compute to finish
+                    if i >= 1:
+                        self.transfer_stream.wait_event(compute_events[i - 1])
 
+                    self._stage_k_quant[next_slot].copy_(next_kq, non_blocking=True)
+                    self._stage_k_scale[next_slot].copy_(next_ks, non_blocking=True)
+                    self._stage_v_quant[next_slot].copy_(next_vq, non_blocking=True)
+                    self._stage_v_scale[next_slot].copy_(next_vs, non_blocking=True)
+                    transfer_events[i + 1].record(self.transfer_stream)
+
+            # Stream 2: Waits on transfer event and executes Triton kernel for chunk (i)
+            out_offset = i * self.chunk_size
+            k_dest_slice = dest_k_out[out_offset : out_offset + self.chunk_size]
+            v_dest_slice = dest_v_out[out_offset : out_offset + self.chunk_size]
+            cos_d = cos_all[i : i + 1]
+            sin_d = sin_all[i : i + 1]
+
+            with torch.cuda.stream(self.compute_stream):
+                self.compute_stream.wait_event(transfer_events[i])
+
+                triton_fused_k_dequant_rope_shift(
+                    self._stage_k_quant[curr_slot],
+                    self._stage_k_scale[curr_slot],
+                    cos_d,
+                    sin_d,
+                    out=k_dest_slice,
+                )
+                dequant_value(
+                    self._stage_v_quant[curr_slot],
+                    self._stage_v_scale[curr_slot],
+                    out=v_dest_slice,
+                )
+                compute_events[i].record(self.compute_stream)
+
+        # Synchronize only compute_stream at the end of the entire pipeline
         self.compute_stream.synchronize()
         return dest_k_out, dest_v_out
 

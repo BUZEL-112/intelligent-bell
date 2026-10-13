@@ -285,3 +285,75 @@ def test_chunk_radix_tree_prefix_matching():
     mismatch_seq = chunk0 + [999] * 32
     matches_mismatch = tree.match_prefix(mismatch_seq)
     assert matches_mismatch == [(0, 10)]
+
+
+# ==============================================================================
+# Async DMA Pipeline Multi-Chunk Parity Test
+# ==============================================================================
+
+def test_async_dma_pipeline_multi_chunk_parity():
+    """Verify pipelined double-buffered async DMA matches reference across multi-chunk prompt."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    chunk_size = 64
+    heads = 4
+    head_dim = 64
+    embed_dim = 32
+
+    engine = SpecCacheEngine(
+        chunk_size=chunk_size,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        max_blocks=16,
+        embedding_dim=embed_dim,
+        device=device,
+        force_fallback_semantic=True,
+    )
+
+    num_chunks = 4
+    chunk_tokens_list = []
+    chunk_raw_data = []
+
+    for c in range(num_chunks):
+        toks = list(range(c * 500, c * 500 + chunk_size))
+        chunk_tokens_list.append(toks)
+        kq, ks, vq, vs = _generate_synthetic_chunk(chunk_size, heads, head_dim, seed=200 + c)
+        p_cached = c * 128
+        bid = engine.register_chunk(
+            token_ids=toks,
+            cached_position=p_cached,
+            k_quant=kq,
+            k_scale=ks,
+            v_quant=vq,
+            v_scale=vs,
+        )
+        chunk_raw_data.append((bid, kq, ks, vq, vs, p_cached))
+
+    # Query with target positions shifted by varying amounts
+    target_positions = [c * 256 for c in range(num_chunks)]
+    k_out, v_out, decisions = engine.retrieve_and_reconstruct_kv(
+        chunks_tokens=chunk_tokens_list,
+        target_positions=target_positions,
+    )
+
+    assert len(decisions) == num_chunks
+    assert k_out.shape == (num_chunks * chunk_size, heads, head_dim)
+    assert v_out.shape == (num_chunks * chunk_size, heads, head_dim)
+
+    # Compare each chunk slice against eager reference
+    for i in range(num_chunks):
+        bid, kq, ks, vq, vs, p_cached = chunk_raw_data[i]
+        delta_p = target_positions[i] - p_cached
+        cos_d, sin_d = compute_rope_cos_sin_delta(
+            torch.tensor([delta_p], device=device), head_dim, device=device
+        )
+        k_ref = pytorch_eager_dequant_rope_shift(
+            kq.to(device), ks.to(device), cos_d, sin_d
+        )
+        v_ref = dequant_value_ref(vq.to(device), vs.to(device))
+
+        k_slice = k_out[i * chunk_size : (i + 1) * chunk_size]
+        v_slice = v_out[i * chunk_size : (i + 1) * chunk_size]
+
+        torch.testing.assert_close(k_slice, k_ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(v_slice, v_ref, atol=1e-2, rtol=1e-2)
+
