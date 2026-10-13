@@ -23,6 +23,7 @@ dev = [
     "pytest>=7.4.0",
     "ruff>=0.1.0",
     "matplotlib>=3.7.0",
+    "faiss-cpu>=1.7.4",
 ]
 
 [tool.setuptools.packages.find]

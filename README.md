@@ -1,141 +1,141 @@
-# SpecCache: Phase 1 Fused INT8 RoPE KV-Cache Engine
+# SpecCache: Hardware-Aware Semantic KV-Cache Engine
 
 SpecCache is a hardware-aware semantic KV-cache engine designed for high-throughput LLM serving.
-Phase 1 provides an autotuned OpenAI Triton kernel that fuses per-token-head INT8 KV-cache dequantization with in-place relative Rotary Position Embedding (RoPE) phase-shifting.
 
 ---
 
-## 1. Mathematical Grounding & System Motivation
+## Architecture Overview
 
-When reusing cached Key states from prior requests or earlier document chunks, cached keys were originally rotated at token positions $m$. In the new context, the reused chunk lands at positions $m + \Delta p$.
-
-By the rotational group homomorphism of RoPE in $SO(2)$:
-$$R(\theta, m + \Delta p) = R(\theta, \Delta p) R(\theta, m)$$
-
-Relative rotation can be applied directly to already-rotated keys without knowing their original absolute positions $m$.
-
-### Memory Bandwidth Bottleneck in Conventional Serving
-
-In conventional un-fused pipelines, shifting cached keys incurs heavy High Bandwidth Memory (HBM) roundtrips:
-1. Load INT8 quantized keys from HBM (1 byte/element)
-2. Dequantize to FP16 and store intermediate buffer to HBM (2 bytes/element)
-3. Load intermediate FP16 keys from HBM (2 bytes/element)
-4. Apply RoPE phase-shift and store rotated FP16 keys to HBM (2 bytes/element)
-
-Total memory traffic in un-fused pipelines:
-$$\text{Memory Traffic}_{\text{un-fused}} \approx 1 + 2 + 2 + 2 = 7 \text{ bytes per element}$$
-
-### Single-Pass SRAM Fusion in SpecCache
-
-SpecCache eliminates all intermediate HBM roundtrips by fusing dequantization and relative rotation inside on-chip SRAM/registers:
-1. Load INT8 keys ($q_{x1}, q_{x2}$) from HBM in contiguous coalesced blocks (1 byte/element)
-2. Load FP16 scales ($s$) and FP16 relative rotary factors ($\cos, \sin$)
-3. Dequantize and rotate in registers using FP32 arithmetic precision
-4. Store rotated FP16 keys directly to the destination buffer (2 bytes/element)
-
-Total memory traffic in SpecCache:
-$$\text{Memory Traffic}_{\text{fused}} \approx 1 + 2 = 3 \text{ bytes per element}$$
-
-Because the arithmetic intensity of this operation is $\approx 1.0 \text{ FLOP/Byte}$ (far below the ridge points of modern GPUs such as A100 at $\approx 9.5 \text{ FLOP/Byte}$ or H100 at $\approx 20 \text{ FLOP/Byte}$), memory traffic reduction translates directly to a theoretical $7 / 3 \approx 2.33\times$ speedup.
+SpecCache operates across two core tiers:
+1. **Phase 1: Fused INT8 Dequantization & Relative RoPE Phase-Shifting Kernel**
+   - Single-pass on-chip SRAM execution eliminates intermediate HBM read/write roundtrips.
+   - 2D grid tiling (`BLOCK_T`, `BLOCK_H`) ensures high occupancy on Ada Lovelace, Ampere, and Hopper architectures.
+   - RoPE identity $R(\theta, m + \Delta p) = R(\theta, \Delta p) R(\theta, m)$ enables in-place chunk phase-shifting without knowing original positions $m$.
+2. **Phase 2: Hybrid Radix-Semantic Lookup & Pinned-Memory DMA Pipeline**
+   - **Tier 1 (Exact Match):** Token-level Radix Tree for $O(L)$ exact prefix/chunk matching.
+   - **Tier 2 (Semantic Match):** FAISS HNSW index (`METRIC_INNER_PRODUCT`, `M=32`, `efSearch=32`) over normalized chunk embeddings.
+   - **Three-Way Routing:**
+     - Direct KV Reuse ($\text{cos\_sim} \ge 0.92$ or exact Radix hit): Computes $\Delta p = p_{\text{target}} - p_{\text{cached}}$ and executes fused kernel.
+     - Speculative Draft Zone ($0.80 \le \text{cos\_sim} < 0.92$): Marks chunk as `SPECULATIVE_DRAFT` and surfaces cached continuation tokens.
+     - Cache Miss ($\text{cos\_sim} < 0.80$): Marks chunk for standard GPU prefill computation.
+   - **Page-Locked Host Memory Pool:** Contiguous host memory slab allocator (`pin_memory=True`) with LRU eviction management.
+   - **Pipelined Double-Buffered Async DMA:** Overlaps PCIe host-to-device transfers of chunk $i+1$ with Phase 1 Triton kernel computation of chunk $i$ across dual CUDA streams.
 
 ---
 
-## 2. Hardware Architecture & 2D Grid Tiling
-
-The Triton kernel `fused_k_dequant_rope_shift_kernel` implements a 2D grid:
-$$\text{Grid} = \left(\left\lceil \frac{T}{\text{BLOCK\_T}} \right\rceil, \left\lceil \frac{H}{\text{BLOCK\_H}} \right\rceil\right)$$
-
-### Key Systems Optimizations:
-1. **SM Saturation on Small Chunks:** Tiling over both tokens (`BLOCK_T`) and heads (`BLOCK_H`) ensures small prompt chunks (e.g. $T=128, H=8$) launch sufficient threadblocks to saturate SMs on Ada Lovelace, Ampere, and Hopper architectures.
-2. **SRAM Register Reuse Across Heads:** RoPE frequencies depend only on token position $t$ and head dimension $d$. By processing `BLOCK_H` heads per block, $\cos$ and $\sin$ are loaded once from HBM into registers and reused across all `BLOCK_H` heads in SRAM.
-3. **Boundary Masking:** 2D masking handles arbitrary non-power-of-two sequence lengths (e.g. $T=17, T=511$) without out-of-bounds memory accesses.
-
----
-
-## 3. Repository Structure
+## Repository Structure
 
 ```text
 speccache/
 ├── __init__.py             # Public API exports
+├── cache/
+│   ├── __init__.py
+│   ├── pinned_pool.py      # Page-locked host memory slab allocator + LRU eviction
+│   ├── radix_index.py      # Token-chunk Radix tree for exact prefix/block hits
+│   ├── semantic_index.py   # FAISS HNSW wrapper + cosine threshold routing logic
+│   └── engine.py           # SpecCacheEngine: orchestrates lookup, async DMA, and Triton kernels
 ├── kernels/
 │   ├── __init__.py
 │   ├── reference.py        # Eager PyTorch reference + torch.compile baseline
 │   └── triton_rope_kv.py   # Autotuned 2D-tiled Triton kernels
 ├── tests/
 │   ├── __init__.py
-│   └── test_correctness.py # Pytest suite across shapes, shifts, and rotational proof
+│   ├── test_correctness.py   # Phase 1 numerical verification and rotational equivalence suite
+│   └── test_phase2_engine.py # Phase 2 PinnedPool, Radix, FAISS, and Async DMA parity suite
 └── benchmarks/
     ├── __init__.py
-    └── bench_roofline.py   # Triton do_bench profiling, GB/s calculation, and plot
-├── Makefile                # Build, test, and benchmark targets
-├── run_phase1.sh           # Automated end-to-end execution script
+    ├── bench_roofline.py     # Phase 1 Triton HBM roofline benchmark
+    └── bench_phase2_dma.py   # Phase 2 Pageable vs Pinned vs Async DMA PCIe benchmark
+├── Makefile                # Unified build, test, and benchmark targets
+├── run_phase1.sh           # Phase 1 automated run script
+├── run_phase2.sh           # Phase 2 automated run script
 └── pyproject.toml          # Project metadata and dependencies
 ```
 
 ---
 
-## 4. Google Colab Validation Guide
+## Validation & Benchmarking Guide (Google Colab / GPU Instance)
 
-To run the verification suite and roofline benchmark in a Google Colab GPU runtime:
+### 1. Automated Execution via Shell Scripts
 
-### Option A: One-Command Execution via `run_phase1.sh`
+Run Phase 1 (Kernel verification + HBM roofline benchmark):
 ```bash
-!chmod +x run_phase1.sh && ./run_phase1.sh
+chmod +x run_phase1.sh && ./run_phase1.sh
 ```
 
-### Option B: Step-by-Step Validation
+Run Phase 2 (Engine verification + PCIe DMA overlap benchmark):
+```bash
+chmod +x run_phase2.sh && ./run_phase2.sh
+```
 
-1. **Install Package in Editable Mode:**
-   ```bash
-   !pip install -e .[dev]
-   ```
+Or using the Makefile:
+```bash
+make test        # Runs both test_correctness.py and test_phase2_engine.py
+make benchmark   # Runs both bench_roofline.py and bench_phase2_dma.py
+```
 
-2. **Run Pytest Correctness Suite:**
-   ```bash
-   !pytest tests/test_correctness.py -v
-   ```
-   This validates:
-   - Numerical tolerance across sequence lengths $T \in [1, 17, 128, 511, 2048, 4096]$
-   - KV head counts $H \in [4, 8, 32]$ (GQA and MHA)
-   - Shifts $\Delta p \in [-512, 0, +1024]$
-   - End-to-end mathematical rotational equivalence proof: rotating at $m=600$, quantizing to INT8, and shifting by $\Delta p=-350$ matches direct rotation at $m+\Delta p=250$.
+### 2. Step-by-Step Validation
 
-3. **Run Roofline Benchmark:**
-   ```bash
-   !python benchmarks/bench_roofline.py --output-plot benchmarks/phase1_roofline.png
-   ```
+#### Run Phase 2 Tests
+```bash
+pytest tests/test_phase2_engine.py -v
+```
+Verifies:
+- Pinned pool memory allocation and LRU eviction recycling.
+- Radix tree exact matching, edge splitting on shared prefixes, and $O(1)$ eviction.
+- Semantic HNSW index cosine routing thresholds ($0.92$ and $0.80$).
+- Two-tier lookup orchestration in `SpecCacheEngine`.
+- Asynchronous dual-stream DMA pipeline numerical parity against eager PyTorch.
 
-4. **Display Generated Dark-Mode Dual-Subplot Roofline Plot:**
-   ```python
-   from IPython.display import Image
-   Image("benchmarks/phase1_roofline.png")
-   ```
+#### Run Phase 2 PCIe DMA Benchmark
+```bash
+python benchmarks/bench_phase2_dma.py --output-plot benchmarks/phase2_dma_overlap.png
+```
+Produces:
+- Formatted Markdown throughput table comparing Pageable (Sync), Pinned (Sync), and Pipelined Double-Buffered Async DMA.
+- High-resolution dark-mode dual-subplot plot saved to `benchmarks/phase2_dma_overlap.png`.
 
 ---
 
-## 5. Python API Usage
+## Phase 2 Python API Usage
 
 ```python
 import torch
-from speccache import (
-    compute_rope_cos_sin_delta,
-    quantize_kv_int8,
-    triton_fused_k_dequant_rope_shift,
+from speccache import SpecCacheEngine, quantize_kv_int8
+
+# Initialize engine
+engine = SpecCacheEngine(
+    chunk_size=128,
+    num_kv_heads=8,
+    head_dim=128,
+    max_blocks=1024,
+    embedding_dim=128,
+    tau_reuse=0.92,
+    tau_spec=0.80,
+    device=torch.device("cuda"),
 )
 
-# Allocate KV tensors on GPU
-num_tokens, num_heads, head_dim = 2048, 8, 128
-device = torch.device("cuda")
-
-# Quantize raw keys to INT8 with dynamic per-token-head absmax scale
-raw_k = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.float32, device=device)
+# Register a cached prompt chunk
+token_ids = list(range(100, 228))
+raw_k = torch.randn((128, 8, 128), dtype=torch.float32)
+raw_v = torch.randn((128, 8, 128), dtype=torch.float32)
 k_quant, k_scale = quantize_kv_int8(raw_k)
+v_quant, v_scale = quantize_kv_int8(raw_v)
+embedding = torch.randn(128)
 
-# Compute relative RoPE tables for a relative displacement of +64 tokens
-delta_positions = torch.tensor([64], device=device)
-cos_delta, sin_delta = compute_rope_cos_sin_delta(delta_positions, head_dim, device=device)
+block_id = engine.register_chunk(
+    token_ids=token_ids,
+    cached_position=0,
+    k_quant=k_quant,
+    k_scale=k_scale,
+    v_quant=v_quant,
+    v_scale=v_scale,
+    embedding=embedding,
+)
 
-# Execute fused kernel with optional pre-allocated output buffer
-k_out = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
-triton_fused_k_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=k_out)
+# Two-tier hierarchical lookup for incoming prompt
+decisions = engine.lookup_chunks(prompt_tokens=token_ids, chunk_embeddings=[embedding])
+
+# Asynchronously stream reused chunks over PCIe and execute relative RoPE
+k_gpu, v_gpu = engine.execute_async_dma_and_rope(decisions)
 ```

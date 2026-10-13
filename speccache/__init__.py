@@ -2,8 +2,23 @@
 
 Phase 1 provides fused INT8 dequantization and relative RoPE phase-shifting
 kernels targeting high-throughput memory-bandwidth bound LLM serving pipelines.
+
+Phase 2 provides the hybrid Radix-semantic lookup engine, page-locked (pinned)
+host memory pool with LRU eviction, and asynchronous dual-stream PCIe DMA pipeline.
 """
 
+from speccache.cache import (
+    BlockMetadata,
+    ChunkRoutingDecision,
+    ChunkRoutingStatus,
+    PinnedHostPool,
+    RadixMatchResult,
+    RadixTree,
+    SemanticIndex,
+    SemanticLookupResult,
+    SemanticRoutingAction,
+    SpecCacheEngine,
+)
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
     dequant_and_rope_key_compiled,
@@ -25,6 +40,18 @@ from speccache.kernels.triton_rope_kv import (
 )
 
 __all__ = [
+    # Phase 2 Cache & Engine
+    "BlockMetadata",
+    "ChunkRoutingDecision",
+    "ChunkRoutingStatus",
+    "PinnedHostPool",
+    "RadixMatchResult",
+    "RadixTree",
+    "SemanticIndex",
+    "SemanticLookupResult",
+    "SemanticRoutingAction",
+    "SpecCacheEngine",
+    # Phase 1 Kernels
     "compute_rope_cos_sin_delta",
     "dequant_and_rope_key",
     "dequant_and_rope_key_compiled",

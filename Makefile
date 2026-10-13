@@ -1,15 +1,25 @@
-.PHONY: all install test benchmark clean
+.PHONY: all install test test-phase1 test-phase2 benchmark bench-phase1 bench-phase2 clean
 
 all: install test benchmark
 
 install:
 	pip install -e .[dev]
 
-test:
+test: test-phase1 test-phase2
+
+test-phase1:
 	pytest tests/test_correctness.py -v
 
-benchmark:
+test-phase2:
+	pytest tests/test_phase2_engine.py -v
+
+benchmark: bench-phase1 bench-phase2
+
+bench-phase1:
 	python benchmarks/bench_roofline.py --output-plot benchmarks/phase1_roofline.png
+
+bench-phase2:
+	python benchmarks/bench_phase2_dma.py --output-plot benchmarks/phase2_dma_overlap.png
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
