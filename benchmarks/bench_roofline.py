@@ -19,6 +19,7 @@ Bytes Transferred = (T * H * D * 1)   # k_quant (INT8 read)
 """
 
 import argparse
+import os
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import torch
@@ -256,6 +257,7 @@ def render_dark_mode_roofline_plots(
     ax2.grid(True, linestyle="--", alpha=0.3, color="#444444")
 
     plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="#121212")
     plt.close(fig)
 
