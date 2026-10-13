@@ -376,6 +376,7 @@ class SpecCacheEngine:
         reused_decisions: List[ChunkRoutingDecision],
         dest_k_out: Optional[torch.Tensor] = None,
         dest_v_out: Optional[torch.Tensor] = None,
+        sync: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Double-buffered asynchronous PCIe DMA pipeline overlapping transfer with Triton kernel."""
         valid_chunks = [
@@ -491,8 +492,9 @@ class SpecCacheEngine:
                 )
                 compute_events[i].record(self.compute_stream)
 
-        # Synchronize only compute_stream at the end of the entire pipeline
-        self.compute_stream.synchronize()
+        # Synchronize once after all chunks are enqueued
+        if sync:
+            torch.cuda.synchronize(self.device)
         return dest_k_out, dest_v_out
 
     def _execute_cpu_fallback(

@@ -90,48 +90,60 @@ def benchmark_baseline1_fp16_pageable(
     out_k = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
     out_v = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
 
-    # Pre-allocated GPU staging buffers (zero cudaMalloc inside timing loop)
-    stage_k = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device)
-    stage_v = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device)
+    # Pre-allocated GPU staging buffers (two double-buffered slots [chunk_size, H, D])
+    stage_k = [
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device),
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device),
+    ]
+    stage_v = [
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device),
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.float16, device=device),
+    ]
 
     delta_positions = torch.tensor([c * 64 for c in range(num_chunks)], dtype=torch.float32, device=device)
     cos_all, sin_all = compute_rope_cos_sin_delta(delta_positions, head_dim, device=device)
+    cos_full_all = torch.cat([cos_all, cos_all], dim=-1)[:, None, :].to(torch.float32)
+    sin_full_all = torch.cat([sin_all, sin_all], dim=-1)[:, None, :].to(torch.float32)
 
-    def run_iter():
+    def enqueue_chunks():
         for i in range(num_chunks):
+            slot = i % 2
             offset = i * chunk_size
-            stage_k.copy_(k_fp16_chunks[i], non_blocking=False)
-            stage_v.copy_(v_fp16_chunks[i], non_blocking=False)
+            stage_k[slot].copy_(k_fp16_chunks[i], non_blocking=False)
+            stage_v[slot].copy_(v_fp16_chunks[i], non_blocking=False)
 
-            cos_i = cos_all[i : i + 1]
-            sin_i = sin_all[i : i + 1]
-            cos_full = torch.cat([cos_i, cos_i], dim=-1)[:, None, :].to(torch.float32)
-            sin_full = torch.cat([sin_i, sin_i], dim=-1)[:, None, :].to(torch.float32)
+            cos_full = cos_full_all[i : i + 1]
+            sin_full = sin_full_all[i : i + 1]
 
-            k_f32 = stage_k.to(torch.float32)
+            k_f32 = stage_k[slot].to(torch.float32)
             k_rot = (k_f32 * cos_full + rotate_half(k_f32) * sin_full).to(torch.float16)
 
             out_k[offset : offset + chunk_size].copy_(k_rot)
-            out_v[offset : offset + chunk_size].copy_(stage_v)
+            out_v[offset : offset + chunk_size].copy_(stage_v[slot])
+
+    # Warmup
+    for _ in range(warmup):
+        enqueue_chunks()
         torch.cuda.synchronize(device)
 
-    for _ in range(warmup):
-        run_iter()
-
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    start_event.record()
+    # Pure device timing using CUDA events
+    times: List[float] = []
     for _ in range(rep):
-        run_iter()
-    end_event.record()
-    torch.cuda.synchronize(device)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
-    return start_event.elapsed_time(end_event) / rep
+        start_event.record()
+        enqueue_chunks()
+        end_event.record()
+
+        torch.cuda.synchronize(device)
+        times.append(start_event.elapsed_time(end_event))
+
+    return float(np.median(times))
 
 
 # ==============================================================================
-# Baseline 2: INT8 Pageable + Phase 1 Triton Kernel (Single Stream)
+# Baseline 2: INT8 Pageable + Phase 1 Triton Kernel (Sequential Single-Stream)
 # ==============================================================================
 
 def benchmark_baseline2_int8_pageable(
@@ -163,50 +175,68 @@ def benchmark_baseline2_int8_pageable(
     out_k = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
     out_v = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
 
-    # Pre-allocated GPU staging buffers (zero cudaMalloc inside timing loop)
-    stage_kq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
-    stage_ks = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
-    stage_vq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
-    stage_vs = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
+    # Pre-allocated GPU staging buffers (two double-buffered slots [chunk_size, H, D])
+    stage_kq = [
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+    ]
+    stage_ks = [
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+    ]
+    stage_vq = [
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+    ]
+    stage_vs = [
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+    ]
 
     delta_positions = torch.tensor([c * 64 for c in range(num_chunks)], dtype=torch.float32, device=device)
     cos_all, sin_all = compute_rope_cos_sin_delta(delta_positions, head_dim, device=device)
 
-    def run_iter():
+    def enqueue_chunks():
         for i in range(num_chunks):
+            slot = i % 2
             offset = i * chunk_size
-            stage_kq.copy_(kq_chunks[i], non_blocking=False)
-            stage_ks.copy_(ks_chunks[i], non_blocking=False)
-            stage_vq.copy_(vq_chunks[i], non_blocking=False)
-            stage_vs.copy_(vs_chunks[i], non_blocking=False)
+            stage_kq[slot].copy_(kq_chunks[i], non_blocking=False)
+            stage_ks[slot].copy_(ks_chunks[i], non_blocking=False)
+            stage_vq[slot].copy_(vq_chunks[i], non_blocking=False)
+            stage_vs[slot].copy_(vs_chunks[i], non_blocking=False)
 
             triton_fused_k_dequant_rope_shift(
-                stage_kq,
-                stage_ks,
+                stage_kq[slot],
+                stage_ks[slot],
                 cos_all[i : i + 1],
                 sin_all[i : i + 1],
                 out=out_k[offset : offset + chunk_size],
             )
             dequant_value(
-                stage_vq,
-                stage_vs,
+                stage_vq[slot],
+                stage_vs[slot],
                 out=out_v[offset : offset + chunk_size],
             )
+
+    # Warmup
+    for _ in range(warmup):
+        enqueue_chunks()
         torch.cuda.synchronize(device)
 
-    for _ in range(warmup):
-        run_iter()
-
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    start_event.record()
+    # Pure device timing using CUDA events
+    times: List[float] = []
     for _ in range(rep):
-        run_iter()
-    end_event.record()
-    torch.cuda.synchronize(device)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
-    return start_event.elapsed_time(end_event) / rep
+        start_event.record()
+        enqueue_chunks()
+        end_event.record()
+
+        torch.cuda.synchronize(device)
+        times.append(start_event.elapsed_time(end_event))
+
+    return float(np.median(times))
 
 
 # ==============================================================================
@@ -229,52 +259,70 @@ def benchmark_baseline3_int8_pinned_sync(
     out_k = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
     out_v = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
 
-    # Pre-allocated GPU staging buffers (zero cudaMalloc inside timing loop)
-    stage_kq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
-    stage_ks = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
-    stage_vq = torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device)
-    stage_vs = torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device)
+    # Pre-allocated GPU staging buffers (two double-buffered slots [chunk_size, H, D])
+    stage_kq = [
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+    ]
+    stage_ks = [
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+    ]
+    stage_vq = [
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+        torch.empty((chunk_size, num_heads, head_dim), dtype=torch.int8, device=device),
+    ]
+    stage_vs = [
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+        torch.empty((chunk_size, num_heads, 1), dtype=torch.float16, device=device),
+    ]
 
     delta_positions = torch.tensor([d.delta_p for d in decisions], dtype=torch.float32, device=device)
     cos_all, sin_all = compute_rope_cos_sin_delta(delta_positions, head_dim, device=device)
 
-    def run_iter():
+    def enqueue_chunks():
         for i, dec in enumerate(decisions):
+            slot = i % 2
             offset = i * chunk_size
             kq_h, ks_h, vq_h, vs_h = engine.pool.get_block_views(dec.block_id)
 
-            stage_kq.copy_(kq_h, non_blocking=False)
-            stage_ks.copy_(ks_h, non_blocking=False)
-            stage_vq.copy_(vq_h, non_blocking=False)
-            stage_vs.copy_(vs_h, non_blocking=False)
+            stage_kq[slot].copy_(kq_h, non_blocking=False)
+            stage_ks[slot].copy_(ks_h, non_blocking=False)
+            stage_vq[slot].copy_(vq_h, non_blocking=False)
+            stage_vs[slot].copy_(vs_h, non_blocking=False)
 
             triton_fused_k_dequant_rope_shift(
-                stage_kq,
-                stage_ks,
+                stage_kq[slot],
+                stage_ks[slot],
                 cos_all[i : i + 1],
                 sin_all[i : i + 1],
                 out=out_k[offset : offset + chunk_size],
             )
             dequant_value(
-                stage_vq,
-                stage_vs,
+                stage_vq[slot],
+                stage_vs[slot],
                 out=out_v[offset : offset + chunk_size],
             )
+
+    # Warmup
+    for _ in range(warmup):
+        enqueue_chunks()
         torch.cuda.synchronize(device)
 
-    for _ in range(warmup):
-        run_iter()
-
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    start_event.record()
+    # Pure device timing using CUDA events
+    times: List[float] = []
     for _ in range(rep):
-        run_iter()
-    end_event.record()
-    torch.cuda.synchronize(device)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
-    return start_event.elapsed_time(end_event) / rep
+        start_event.record()
+        enqueue_chunks()
+        end_event.record()
+
+        torch.cuda.synchronize(device)
+        times.append(start_event.elapsed_time(end_event))
+
+    return float(np.median(times))
 
 
 # ==============================================================================
@@ -295,19 +343,30 @@ def benchmark_baseline4_speccache_async(
     out_k = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
     out_v = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
 
+    # Warmup
     for _ in range(warmup):
-        engine.execute_async_dma_and_rope(decisions, dest_k_out=out_k, dest_v_out=out_v)
+        engine.execute_async_dma_and_rope(decisions, dest_k_out=out_k, dest_v_out=out_v, sync=True)
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    start_event.record()
+    # Pure device timing across dual streams using CUDA events
+    times: List[float] = []
     for _ in range(rep):
-        engine.execute_async_dma_and_rope(decisions, dest_k_out=out_k, dest_v_out=out_v)
-    end_event.record()
-    torch.cuda.synchronize(device)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
-    return start_event.elapsed_time(end_event) / rep
+        # Record start timestamp on transfer stream immediately prior to chunk 0 DMA
+        start_event.record(engine.transfer_stream)
+
+        # Enqueue all chunks on dual streams without CPU synchronization
+        engine.execute_async_dma_and_rope(decisions, dest_k_out=out_k, dest_v_out=out_v, sync=False)
+
+        # Record completion timestamp on compute stream after chunk N-1 kernel finishes
+        end_event.record(engine.compute_stream)
+
+        # Synchronize host thread once after all chunks are enqueued
+        torch.cuda.synchronize(device)
+        times.append(start_event.elapsed_time(end_event))
+
+    return float(np.median(times))
 
 
 # ==============================================================================
