@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speccache"
+version = "0.1.0"
+description = "Phase 1: Hardware-aware semantic KV-cache engine fusing INT8 dequantization with relative RoPE phase-shifting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "SpecCache Engineering Team" }
+]
+keywords = ["gpu", "triton", "llm", "kv-cache", "rope", "quantization"]
+dependencies = [
+    "torch>=2.1.0",
+    "triton>=2.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "ruff>=0.1.0",
+    "matplotlib>=3.7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["speccache*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
