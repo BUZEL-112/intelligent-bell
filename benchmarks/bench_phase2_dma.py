@@ -15,7 +15,7 @@ Evaluates:
 import argparse
 import os
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
