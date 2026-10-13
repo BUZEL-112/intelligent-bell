@@ -1,22 +1,24 @@
 """Production-grade, autotuned OpenAI Triton kernels for SpecCache Phase 1.
 
-This module fuses:
+Fuses:
 1. Per-token-head INT8 KV-cache dequantization with in-place relative
    Rotary Position Embedding (RoPE) phase-shifting for Key states.
 2. High-throughput INT8 dequantization for Value states.
 
 Hardware-Aware Systems Design Principles:
-- Fused Single-Pass SRAM Execution: Eliminates intermediate HBM roundtrips
-  (INT8 -> FP16 HBM store -> FP16 HBM load -> RoPE -> FP16 HBM store), reducing
-  memory bus traffic by ~2.3x.
-- Memory Coalescing: Head dimension D is contiguous (stride 1). Threadblocks
-  coalesce global memory loads and stores across warps.
-- Grouped-Query Attention (GQA) & Multi-Query Attention (MQA) Support:
-  The kernel grids over M = T * H token-head vectors, seamlessly scaling across
-  any KV head count (e.g., H=1 for MQA, H=8 for Llama 3 / Mistral, H=32 for MHA).
-- Uniform & Per-Token Relative Shifting: Stride broadcasting enables a single
-  kernel instance to support scalar block shifts [1, D // 2] and per-token
-  shifts [T, D // 2] with zero runtime overhead.
+- 2D Grid Tiling (BLOCK_T, BLOCK_H): Tiles over both token chunks and KV heads
+  in a 2D grid (cdiv(T, BLOCK_T), cdiv(H, BLOCK_H)). This ensures small token
+  chunks (e.g., T=128 with H=8) launch sufficient threadblocks to saturate SMs
+  on NVIDIA Ada Lovelace, Ampere, and Hopper architectures.
+- SRAM Register Reuse: RoPE factors cos and sin depend solely on token position
+  and head dimension, remaining invariant across head indices. By tiling over
+  BLOCK_H heads in each block, cos and sin factors are loaded once into registers
+  and reused across all BLOCK_H heads in SRAM, eliminating redundant HBM reads.
+- Robust Boundary Masking: 2D/3D masking guards against arbitrary non-power-of-two
+  sequence lengths (e.g., T=17, T=511) to guarantee memory safety.
+- Numerical Stability: INT8 keys and FP16 scales are cast to FP32 in registers
+  for dequantization and rotary matrix multiplication, then cast to FP16 before
+  storing to k_out.
 """
 
 from typing import Optional, Tuple
@@ -39,23 +41,36 @@ if TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_M": 1}, num_warps=2, num_stages=2),
-            triton.Config({"BLOCK_M": 2}, num_warps=2, num_stages=2),
-            triton.Config({"BLOCK_M": 4}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 8}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 16}, num_warps=8, num_stages=3),
+            # Balanced 2D tiles for small to medium token counts
+            triton.Config({"BLOCK_T": 1, "BLOCK_H": 1}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 1, "BLOCK_H": 2}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 1, "BLOCK_H": 4}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 4, "BLOCK_H": 1}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 4, "BLOCK_H": 2}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 4, "BLOCK_H": 4}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_T": 8, "BLOCK_H": 1}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 8, "BLOCK_H": 2}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_T": 8, "BLOCK_H": 4}, num_warps=4, num_stages=3),
+            triton.Config({"BLOCK_T": 8, "BLOCK_H": 8}, num_warps=8, num_stages=3),
+            # Large token tiles for long-context prefill / prompt caching
+            triton.Config({"BLOCK_T": 16, "BLOCK_H": 1}, num_warps=4, num_stages=3),
+            triton.Config({"BLOCK_T": 16, "BLOCK_H": 2}, num_warps=4, num_stages=3),
+            triton.Config({"BLOCK_T": 16, "BLOCK_H": 4}, num_warps=8, num_stages=3),
+            triton.Config({"BLOCK_T": 32, "BLOCK_H": 1}, num_warps=4, num_stages=3),
+            triton.Config({"BLOCK_T": 32, "BLOCK_H": 2}, num_warps=8, num_stages=4),
         ],
-        key=["num_m", "d_half"],
+        key=["num_tokens", "num_heads", "head_dim"],
     )
     @triton.jit
-    def _fused_dequant_rope_key_kernel(
+    def fused_k_dequant_rope_shift_kernel(
         k_quant_ptr,
         k_scale_ptr,
         cos_delta_ptr,
         sin_delta_ptr,
         k_out_ptr,
-        num_m,
+        num_tokens,
         num_heads,
+        head_dim,
         d_half,
         stride_kt,
         stride_kh,
@@ -69,91 +84,109 @@ if TRITON_AVAILABLE:
         stride_ot,
         stride_oh,
         stride_od,
-        BLOCK_M: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        BLOCK_H: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
-        """Fused INT8 Dequantization + Relative RoPE Phase-Shift Kernel.
+        """Fused 2D-Tiled INT8 Dequantization + Relative RoPE Phase-Shift Kernel.
 
-        Grids over M = num_tokens * num_heads.
-        Each thread block processes BLOCK_M token-head vectors and BLOCK_D head-dim
-        elements (where BLOCK_D >= d_half = D // 2).
+        Grid layout:
+            program_id(0): Token chunk index (cdiv(num_tokens, BLOCK_T))
+            program_id(1): Head chunk index (cdiv(num_heads, BLOCK_H))
+
+        Each thread block processes a 2D tile (BLOCK_T, BLOCK_H, BLOCK_D) where
+        BLOCK_D >= d_half = head_dim // 2.
         """
-        pid = tl.program_id(axis=0)
-        m_offsets = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-        d_offsets = tl.arange(0, BLOCK_D)
+        pid_t = tl.program_id(axis=0)
+        pid_h = tl.program_id(axis=1)
 
-        m_mask = m_offsets < num_m
-        d_mask = d_offsets < d_half
-        mask_2d = m_mask[:, None] & d_mask[None, :]
+        offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        offs_d = tl.arange(0, BLOCK_D)
 
-        # Decompose linear token-head index into token (t) and head (h)
-        t_idx = m_offsets // num_heads
-        h_idx = m_offsets % num_heads
+        mask_t = offs_t < num_tokens
+        mask_h = offs_h < num_heads
+        mask_d = offs_d < d_half
 
-        # Key tensor global memory address computation
-        # k_quant layout: [T, H, D]
-        k_row_offset = t_idx[:, None] * stride_kt + h_idx[:, None] * stride_kh
-        d_col_offset = d_offsets[None, :] * stride_kd
+        # 2D mask for token-dim factors
+        mask_td = mask_t[:, None] & mask_d[None, :]
 
-        # Pointer to first half: indices [0, D // 2)
-        k1_ptrs = k_quant_ptr + k_row_offset + d_col_offset
-        # Pointer to second half: indices [D // 2, D)
+        # Load relative RoPE cos and sin factors for BLOCK_T tokens
+        # Reused in SRAM across all BLOCK_H heads
+        cos_ptrs = cos_delta_ptr + (offs_t[:, None] * stride_ct) + (offs_d[None, :] * stride_cd)
+        sin_ptrs = sin_delta_ptr + (offs_t[:, None] * stride_sit) + (offs_d[None, :] * stride_sid)
+
+        cos_val = tl.load(cos_ptrs, mask=mask_td, other=0.0).to(tl.float32)
+        sin_val = tl.load(sin_ptrs, mask=mask_td, other=0.0).to(tl.float32)
+
+        # Broadcast across head dimension BLOCK_H: shape [BLOCK_T, 1, BLOCK_D]
+        cos_3d = cos_val[:, None, :]
+        sin_3d = sin_val[:, None, :]
+
+        # 3D mask for loading keys: shape [BLOCK_T, BLOCK_H, BLOCK_D]
+        mask_3d = mask_t[:, None, None] & mask_h[None, :, None] & mask_d[None, None, :]
+
+        # Pointer arithmetic for first half [0, D // 2)
+        k_base = (
+            offs_t[:, None, None] * stride_kt
+            + offs_h[None, :, None] * stride_kh
+            + offs_d[None, None, :] * stride_kd
+        )
+        k1_ptrs = k_quant_ptr + k_base
+        # Pointer arithmetic for second half [D // 2, D)
         k2_ptrs = k1_ptrs + d_half * stride_kd
 
-        # Coalesced global load for quantized INT8 keys
-        q1 = tl.load(k1_ptrs, mask=mask_2d, other=0)
-        q2 = tl.load(k2_ptrs, mask=mask_2d, other=0)
+        # Load quantized INT8 key halves
+        q1 = tl.load(k1_ptrs, mask=mask_3d, other=0)
+        q2 = tl.load(k2_ptrs, mask=mask_3d, other=0)
 
-        # Scale is stored per token-head [T, H, 1]
-        scale_ptrs = k_scale_ptr + (t_idx * stride_st + h_idx * stride_sh)
-        scale = tl.load(scale_ptrs, mask=m_mask, other=0.0)
-        scale_f32 = scale[:, None].to(tl.float32)
+        # Load scales: k_scale shape [T, H, 1]
+        scale_mask = mask_t[:, None, None] & mask_h[None, :, None]
+        scale_ptrs = (
+            k_scale_ptr
+            + offs_t[:, None, None] * stride_st
+            + offs_h[None, :, None] * stride_sh
+        )
+        scale = tl.load(scale_ptrs, mask=scale_mask, other=0.0).to(tl.float32)
 
-        # Dequantize to FP32 in registers to maintain full numerical accuracy
-        x1 = q1.to(tl.float32) * scale_f32
-        x2 = q2.to(tl.float32) * scale_f32
+        # Dequantize with FP32 precision
+        x1 = q1.to(tl.float32) * scale
+        x2 = q2.to(tl.float32) * scale
 
-        # Relative RoPE phase angles
-        # If cos_delta has shape [1, D // 2], stride_ct is 0 (broadcasts across all tokens)
-        # If cos_delta has shape [T, D // 2], stride_ct is stride(0) (per-token shifts)
-        cos_ptrs = cos_delta_ptr + (t_idx[:, None] * stride_ct) + (d_offsets[None, :] * stride_cd)
-        sin_ptrs = sin_delta_ptr + (t_idx[:, None] * stride_sit) + (d_offsets[None, :] * stride_sid)
-
-        cos_val = tl.load(cos_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
-        sin_val = tl.load(sin_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
-
-        # HuggingFace Llama/Qwen Half-Rotated RoPE pairing:
+        # Relative RoPE phase-shifting
         # out1 = x1 * cos - x2 * sin
         # out2 = x2 * cos + x1 * sin
-        out1 = x1 * cos_val - x2 * sin_val
-        out2 = x2 * cos_val + x1 * sin_val
+        out1 = x1 * cos_3d - x2 * sin_3d
+        out2 = x2 * cos_3d + x1 * sin_3d
 
-        # Convert to FP16 and store directly to destination buffer
-        out_row_offset = t_idx[:, None] * stride_ot + h_idx[:, None] * stride_oh
-        out_col_offset = d_offsets[None, :] * stride_od
-
-        out1_ptrs = k_out_ptr + out_row_offset + out_col_offset
+        # Store to k_out in FP16
+        out_base = (
+            offs_t[:, None, None] * stride_ot
+            + offs_h[None, :, None] * stride_oh
+            + offs_d[None, None, :] * stride_od
+        )
+        out1_ptrs = k_out_ptr + out_base
         out2_ptrs = out1_ptrs + d_half * stride_od
 
-        tl.store(out1_ptrs, out1.to(tl.float16), mask=mask_2d)
-        tl.store(out2_ptrs, out2.to(tl.float16), mask=mask_2d)
+        tl.store(out1_ptrs, out1.to(tl.float16), mask=mask_3d)
+        tl.store(out2_ptrs, out2.to(tl.float16), mask=mask_3d)
+
 
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_M": 1}, num_warps=2, num_stages=2),
-            triton.Config({"BLOCK_M": 2}, num_warps=2, num_stages=2),
-            triton.Config({"BLOCK_M": 4}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 8}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 16}, num_warps=8, num_stages=3),
+            triton.Config({"BLOCK_T": 1, "BLOCK_H": 1}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 4, "BLOCK_H": 2}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_T": 8, "BLOCK_H": 4}, num_warps=4, num_stages=3),
+            triton.Config({"BLOCK_T": 16, "BLOCK_H": 4}, num_warps=8, num_stages=3),
         ],
-        key=["num_m", "head_dim"],
+        key=["num_tokens", "num_heads", "head_dim"],
     )
     @triton.jit
-    def _dequant_value_kernel(
+    def _dequant_value_kernel_2d(
         v_quant_ptr,
         v_scale_ptr,
         v_out_ptr,
-        num_m,
+        num_tokens,
         num_heads,
         head_dim,
         stride_vt,
@@ -164,50 +197,61 @@ if TRITON_AVAILABLE:
         stride_ot,
         stride_oh,
         stride_od,
-        BLOCK_M: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        BLOCK_H: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         """Fused INT8 Dequantization Kernel for Value states."""
-        pid = tl.program_id(axis=0)
-        m_offsets = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-        d_offsets = tl.arange(0, BLOCK_D)
+        pid_t = tl.program_id(axis=0)
+        pid_h = tl.program_id(axis=1)
 
-        m_mask = m_offsets < num_m
-        d_mask = d_offsets < head_dim
-        mask_2d = m_mask[:, None] & d_mask[None, :]
+        offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        offs_d = tl.arange(0, BLOCK_D)
 
-        t_idx = m_offsets // num_heads
-        h_idx = m_offsets % num_heads
+        mask_3d = (
+            (offs_t[:, None, None] < num_tokens)
+            & (offs_h[None, :, None] < num_heads)
+            & (offs_d[None, None, :] < head_dim)
+        )
 
         v_ptrs = (
             v_quant_ptr
-            + (t_idx[:, None] * stride_vt + h_idx[:, None] * stride_vh)
-            + (d_offsets[None, :] * stride_vd)
+            + offs_t[:, None, None] * stride_vt
+            + offs_h[None, :, None] * stride_vh
+            + offs_d[None, None, :] * stride_vd
         )
-        q = tl.load(v_ptrs, mask=mask_2d, other=0)
+        q = tl.load(v_ptrs, mask=mask_3d, other=0)
 
-        scale_ptrs = v_scale_ptr + (t_idx * stride_st + h_idx * stride_sh)
-        scale = tl.load(scale_ptrs, mask=m_mask, other=0.0)
-        scale_f32 = scale[:, None].to(tl.float32)
+        scale_mask = (offs_t[:, None, None] < num_tokens) & (offs_h[None, :, None] < num_heads)
+        scale_ptrs = (
+            v_scale_ptr
+            + offs_t[:, None, None] * stride_st
+            + offs_h[None, :, None] * stride_sh
+        )
+        scale = tl.load(scale_ptrs, mask=scale_mask, other=0.0).to(tl.float32)
 
-        out = q.to(tl.float32) * scale_f32
+        out = q.to(tl.float32) * scale
 
         out_ptrs = (
             v_out_ptr
-            + (t_idx[:, None] * stride_ot + h_idx[:, None] * stride_oh)
-            + (d_offsets[None, :] * stride_od)
+            + offs_t[:, None, None] * stride_ot
+            + offs_h[None, :, None] * stride_oh
+            + offs_d[None, None, :] * stride_od
         )
-        tl.store(out_ptrs, out.to(tl.float16), mask=mask_2d)
+        tl.store(out_ptrs, out.to(tl.float16), mask=mask_3d)
 
 
-def dequant_and_rope_key(
+def triton_fused_k_dequant_rope_shift(
     k_quant: torch.Tensor,
     k_scale: torch.Tensor,
     cos_delta: torch.Tensor,
     sin_delta: torch.Tensor,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Execute production Triton kernel fusing INT8 dequantization with relative RoPE.
+    """Execute production 2D-tiled Triton kernel fusing INT8 dequant with relative RoPE.
+
+    Validates tensor shapes, dtypes, contiguous layouts, and CUDA device compatibility.
 
     Args:
         k_quant: INT8 quantized keys of shape [num_tokens, num_kv_heads, head_dim].
@@ -231,43 +275,47 @@ def dequant_and_rope_key(
 
     t, h, d = k_quant.shape
     d_half = d // 2
-    num_m = t * h
 
     if out is None:
         out = torch.empty((t, h, d), dtype=torch.float16, device=k_quant.device)
 
     # Ensure tensors are contiguous for optimal coalesced memory access
-    k_quant_contig = k_quant.contiguous()
-    k_scale_contig = k_scale.contiguous()
-    cos_delta_contig = cos_delta.contiguous()
-    sin_delta_contig = sin_delta.contiguous()
+    k_quant_c = k_quant.contiguous()
+    k_scale_c = k_scale.contiguous()
+    cos_delta_c = cos_delta.contiguous()
+    sin_delta_c = sin_delta.contiguous()
 
     # Determine token stride for cos and sin:
-    # If shape is [1, D // 2], set token stride to 0 for automatic kernel-level broadcasting.
-    stride_ct = 0 if cos_delta_contig.shape[0] == 1 else cos_delta_contig.stride(0)
-    stride_cd = cos_delta_contig.stride(1)
+    # If shape is [1, D // 2], stride_ct is 0 for kernel-level token broadcasting.
+    stride_ct = 0 if cos_delta_c.shape[0] == 1 else cos_delta_c.stride(0)
+    stride_cd = cos_delta_c.stride(1)
 
-    stride_sit = 0 if sin_delta_contig.shape[0] == 1 else sin_delta_contig.stride(0)
-    stride_sid = sin_delta_contig.stride(1)
+    stride_sit = 0 if sin_delta_c.shape[0] == 1 else sin_delta_c.stride(0)
+    stride_sid = sin_delta_c.stride(1)
 
     block_d = triton.next_power_of_2(d_half)
 
-    grid = lambda META: (triton.cdiv(num_m, META["BLOCK_M"]),)
+    # 2D Grid launch: (cdiv(T, BLOCK_T), cdiv(H, BLOCK_H))
+    grid = lambda META: (
+        triton.cdiv(t, META["BLOCK_T"]),
+        triton.cdiv(h, META["BLOCK_H"]),
+    )
 
-    _fused_dequant_rope_key_kernel[grid](
-        k_quant_contig,
-        k_scale_contig,
-        cos_delta_contig,
-        sin_delta_contig,
+    fused_k_dequant_rope_shift_kernel[grid](
+        k_quant_c,
+        k_scale_c,
+        cos_delta_c,
+        sin_delta_c,
         out,
-        num_m,
+        t,
         h,
+        d,
         d_half,
-        k_quant_contig.stride(0),
-        k_quant_contig.stride(1),
-        k_quant_contig.stride(2),
-        k_scale_contig.stride(0),
-        k_scale_contig.stride(1),
+        k_quant_c.stride(0),
+        k_quant_c.stride(1),
+        k_quant_c.stride(2),
+        k_scale_c.stride(0),
+        k_scale_c.stride(1),
         stride_ct,
         stride_cd,
         stride_sit,
@@ -279,6 +327,10 @@ def dequant_and_rope_key(
     )
 
     return out
+
+
+# Alias for backward compatibility
+dequant_and_rope_key = triton_fused_k_dequant_rope_shift
 
 
 def dequant_value(
@@ -307,29 +359,31 @@ def dequant_value(
         )
 
     t, h, d = v_quant.shape
-    num_m = t * h
 
     if out is None:
         out = torch.empty((t, h, d), dtype=torch.float16, device=v_quant.device)
 
-    v_quant_contig = v_quant.contiguous()
-    v_scale_contig = v_scale.contiguous()
+    v_quant_c = v_quant.contiguous()
+    v_scale_c = v_scale.contiguous()
 
     block_d = triton.next_power_of_2(d)
-    grid = lambda META: (triton.cdiv(num_m, META["BLOCK_M"]),)
+    grid = lambda META: (
+        triton.cdiv(t, META["BLOCK_T"]),
+        triton.cdiv(h, META["BLOCK_H"]),
+    )
 
-    _dequant_value_kernel[grid](
-        v_quant_contig,
-        v_scale_contig,
+    _dequant_value_kernel_2d[grid](
+        v_quant_c,
+        v_scale_c,
         out,
-        num_m,
+        t,
         h,
         d,
-        v_quant_contig.stride(0),
-        v_quant_contig.stride(1),
-        v_quant_contig.stride(2),
-        v_scale_contig.stride(0),
-        v_scale_contig.stride(1),
+        v_quant_c.stride(0),
+        v_quant_c.stride(1),
+        v_quant_c.stride(2),
+        v_scale_c.stride(0),
+        v_scale_c.stride(1),
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -349,11 +403,7 @@ def dequant_kv_cache(
     k_out: Optional[torch.Tensor] = None,
     v_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Unified entrypoint to dequantize both Key and Value caches in one call.
-
-    Key states are relative RoPE phase-shifted, while Value states are dequantized
-    directly.
-    """
-    k_res = dequant_and_rope_key(k_quant, k_scale, cos_delta, sin_delta, out=k_out)
+    """Unified entrypoint to dequantize both Key and Value caches in one call."""
+    k_res = triton_fused_k_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=k_out)
     v_res = dequant_value(v_quant, v_scale, out=v_out)
     return k_res, v_res

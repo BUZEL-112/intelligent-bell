@@ -20,6 +20,8 @@ from speccache.kernels.triton_rope_kv import (
     dequant_and_rope_key,
     dequant_kv_cache,
     dequant_value,
+    fused_k_dequant_rope_shift_kernel,
+    triton_fused_k_dequant_rope_shift,
 )
 
 __all__ = [
@@ -31,9 +33,11 @@ __all__ = [
     "dequant_value",
     "dequant_value_compiled",
     "dequant_value_ref",
+    "fused_k_dequant_rope_shift_kernel",
     "pytorch_compiled_dequant_rope_shift",
     "pytorch_eager_dequant_rope_shift",
     "quantize_kv_int8",
     "quantize_symmetric_int8",
     "rotate_half",
+    "triton_fused_k_dequant_rope_shift",
 ]

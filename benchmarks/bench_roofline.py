@@ -1,28 +1,26 @@
-"""HBM Roofline and Latency Benchmark Suite for SpecCache Phase 1.
+"""HBM Memory Bandwidth Roofline Benchmark for SpecCache Phase 1.
 
-This benchmark compares:
-1. Eager PyTorch (un-fused baseline: INT8 dequant to FP16, then separate RoPE)
-2. torch.compile (PyTorch 2.x JIT graph compilation)
-3. SpecCache Fused Triton Kernel (single-pass SRAM dequant + relative RoPE)
+Evaluates:
+1. PyTorch Eager (un-fused baseline: INT8 dequant + rotate_half)
+2. torch.compile (mode="max-autotune-no-cudagraphs")
+3. SpecCache Fused Triton Kernel (fused 2D-tiled dequant + relative RoPE)
 
-Roofline Modeling & Microarchitectural Analysis:
-- Algorithm Arithmetic Intensity:
-  For each head-dim pair (2 elements):
-  - Read: 2 bytes INT8 + 2/D bytes scale + 4/H bytes cos/sin
-  - Write: 4 bytes FP16
-  - Total Memory: ~6.03 bytes per pair (~3.015 bytes/element)
-  - Floating Point Operations: 2 muls (dequant) + 4 ops (RoPE) = 6 FLOPs
-  - Arithmetic Intensity = 6 FLOPs / 6.03 Bytes = ~1.0 FLOP/Byte.
-- Because 1.0 FLOP/Byte is far below modern GPU ridge points (typically 10 to 20
-  FLOP/Byte on A100/H100/L4), this workload is strictly memory-bandwidth bound.
-- Un-fused PyTorch incurs an intermediate FP16 write and FP16 re-read in HBM,
-  consuming ~7 bytes/element.
-- The SpecCache fused kernel consumes ~3 bytes/element, yielding a theoretical
-  2.33x reduction in memory traffic and proportional latency speedup.
+Evaluates two representative LLM architectures:
+- Llama-3-8B GQA configuration: H = 8 KV heads, D = 128 head dim
+- 70B / MHA configuration: H = 32 KV heads, D = 128 head dim
+
+Evaluates sequence lengths: T in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+
+Memory Traffic Formula:
+Bytes Transferred = (T * H * D * 1)   # k_quant (INT8 read)
+                  + (T * H * 2)       # k_scale (FP16 read)
+                  + (T * D * 2)       # cos/sin (FP16 read)
+                  + (T * H * D * 2)   # k_out   (FP16 write)
 """
 
 import argparse
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
+import matplotlib.pyplot as plt
 import torch
 
 try:
@@ -34,16 +32,16 @@ except ImportError:
 
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
-    dequant_and_rope_key_ref,
-    quantize_symmetric_int8,
+    pytorch_compiled_dequant_rope_shift,
+    pytorch_eager_dequant_rope_shift,
+    quantize_kv_int8,
 )
 
 if TRITON_AVAILABLE:
-    from speccache.kernels.triton_rope_kv import dequant_and_rope_key
+    from speccache.kernels.triton_rope_kv import triton_fused_k_dequant_rope_shift
 
 
-# Known GPU peak HBM bandwidths in GB/s
-GPU_PEAK_HBM_BANDWIDTH_GBPS: Dict[str, float] = {
+KNOWN_GPU_PEAK_HBM_GBPS: Dict[str, float] = {
     "A100-SXM4-80GB": 2039.0,
     "A100-SXM4-40GB": 1555.0,
     "A100-PCIE-40GB": 1555.0,
@@ -58,224 +56,280 @@ GPU_PEAK_HBM_BANDWIDTH_GBPS: Dict[str, float] = {
 }
 
 
-def detect_peak_bandwidth(device_name: str) -> float:
-    """Infer theoretical peak memory bandwidth from device name or return default."""
-    for key, bw in GPU_PEAK_HBM_BANDWIDTH_GBPS.items():
+def detect_peak_hbm_bandwidth(device_name: str) -> float:
+    """Infer peak memory bandwidth in GB/s from GPU device name."""
+    for key, bw in KNOWN_GPU_PEAK_HBM_GBPS.items():
         if key.lower() in device_name.lower():
             return bw
-    # Default to modern high-end GPU bandwidth if unrecognized
     return 1500.0
 
 
-def calculate_data_volume_bytes(
-    num_tokens: int,
-    num_heads: int,
-    head_dim: int,
-    is_fused: bool,
-) -> int:
-    """Calculate theoretical global memory transfer volume in bytes.
+def calculate_exact_bytes_transferred(t: int, h: int, d: int) -> int:
+    """Compute exact bytes transferred per the mathematical specification.
 
-    For fused kernel:
-    - Read k_quant: T * H * D * 1 byte (INT8)
-    - Read k_scale: T * H * 1 * 2 bytes (FP16)
-    - Read cos/sin: 2 * T * (D // 2) * 2 bytes (FP16)
-    - Write k_out:  T * H * D * 2 bytes (FP16)
-
-    For un-fused baseline (with intermediate HBM buffer):
-    - Extra intermediate write of dequantized FP16: T * H * D * 2 bytes
-    - Extra intermediate read of dequantized FP16:  T * H * D * 2 bytes
+    Bytes = T*H*D*1 (k_quant) + T*H*2 (k_scale) + T*D*2 (cos/sin) + T*H*D*2 (k_out)
     """
-    read_quant = num_tokens * num_heads * head_dim * 1
-    read_scale = num_tokens * num_heads * 1 * 2
-    read_rope = 2 * num_tokens * (head_dim // 2) * 2
-    write_out = num_tokens * num_heads * head_dim * 2
-
-    base_fused = read_quant + read_scale + read_rope + write_out
-    if is_fused:
-        return base_fused
-
-    # Un-fused adds intermediate FP16 store and load
-    intermediate_traffic = 2 * (num_tokens * num_heads * head_dim * 2)
-    return base_fused + intermediate_traffic
+    return (t * h * d * 1) + (t * h * 2) + (t * d * 2) + (t * h * d * 2)
 
 
-def run_benchmark_for_shape(
-    num_tokens: int,
-    num_heads: int,
-    head_dim: int,
+def benchmark_single_configuration(
+    t: int,
+    h: int,
+    d: int,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Benchmark eager, compiled, and Triton implementations for a specific shape."""
-    # Seed for deterministic tensors
+    """Profile Eager, torch.compile, and Triton kernel using triton.testing.do_bench."""
     torch.manual_seed(42)
 
-    raw_k = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.float32, device=device)
-    k_quant, k_scale = quantize_symmetric_int8(raw_k)
+    raw_k = torch.randn((t, h, d), dtype=torch.float32, device=device)
+    k_quant, k_scale = quantize_kv_int8(raw_k)
 
-    deltas = torch.randint(1, 100, (num_tokens,), device=device)
-    cos_delta, sin_delta = compute_rope_cos_sin_delta(deltas, head_dim, device=device)
+    deltas = torch.randint(1, 100, (t,), device=device)
+    cos_delta, sin_delta = compute_rope_cos_sin_delta(deltas, d, device=device)
 
-    # Pre-allocate output buffer to isolate kernel computation from memory allocation
-    k_out_eager = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
-    k_out_compiled = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
-    k_out_triton = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.float16, device=device)
+    # Pre-allocate output buffers to isolate computation from memory allocation
+    out_eager = torch.empty((t, h, d), dtype=torch.float16, device=device)
+    out_compiled = torch.empty((t, h, d), dtype=torch.float16, device=device)
+    out_triton = torch.empty((t, h, d), dtype=torch.float16, device=device)
 
-    # Compiled baseline setup
-    compiled_fn = torch.compile(dequant_and_rope_key_ref, mode="reduce-overhead")
     # Warmup torch.compile
-    compiled_fn(k_quant, k_scale, cos_delta, sin_delta, out=k_out_compiled)
+    pytorch_compiled_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=out_compiled)
 
     # Warmup Triton kernel
-    dequant_and_rope_key(k_quant, k_scale, cos_delta, sin_delta, out=k_out_triton)
+    triton_fused_k_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=out_triton)
 
-    # 1. Eager PyTorch timing
+    # Benchmark using warmup=25, rep=100
     ms_eager = triton.testing.do_bench(
-        lambda: dequant_and_rope_key_ref(k_quant, k_scale, cos_delta, sin_delta, out=k_out_eager)
+        lambda: pytorch_eager_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=out_eager),
+        warmup=25,
+        rep=100,
     )
-
-    # 2. torch.compile timing
     ms_compiled = triton.testing.do_bench(
-        lambda: compiled_fn(k_quant, k_scale, cos_delta, sin_delta, out=k_out_compiled)
+        lambda: pytorch_compiled_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=out_compiled),
+        warmup=25,
+        rep=100,
     )
-
-    # 3. SpecCache Triton timing
     ms_triton = triton.testing.do_bench(
-        lambda: dequant_and_rope_key(k_quant, k_scale, cos_delta, sin_delta, out=k_out_triton)
+        lambda: triton_fused_k_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=out_triton),
+        warmup=25,
+        rep=100,
     )
 
-    # Theoretical minimum bytes for the fused operation
-    min_bytes = calculate_data_volume_bytes(num_tokens, num_heads, head_dim, is_fused=True)
+    exact_bytes = calculate_exact_bytes_transferred(t, h, d)
 
-    # Effective Bandwidth = Minimum Required Bytes / Measured Latency
-    bw_eager = (min_bytes / (ms_eager * 1e-3)) / 1e9
-    bw_compiled = (min_bytes / (ms_compiled * 1e-3)) / 1e9
-    bw_triton = (min_bytes / (ms_triton * 1e-3)) / 1e9
+    # Latency in microseconds (us)
+    us_eager = ms_eager * 1000.0
+    us_compiled = ms_compiled * 1000.0
+    us_triton = ms_triton * 1000.0
+
+    # Effective Memory Bandwidth (GB/s) = Bytes / (seconds * 10^9)
+    bw_eager = (exact_bytes / (ms_eager * 1e-3)) / 1e9
+    bw_compiled = (exact_bytes / (ms_compiled * 1e-3)) / 1e9
+    bw_triton = (exact_bytes / (ms_triton * 1e-3)) / 1e9
+
+    speedup_vs_eager = ms_eager / ms_triton
+    speedup_vs_compile = ms_compiled / ms_triton
 
     return {
-        "ms_eager": ms_eager,
-        "ms_compiled": ms_compiled,
-        "ms_triton": ms_triton,
+        "tokens": t,
+        "us_eager": us_eager,
+        "us_compiled": us_compiled,
+        "us_triton": us_triton,
         "bw_eager": bw_eager,
         "bw_compiled": bw_compiled,
         "bw_triton": bw_triton,
-        "speedup_vs_eager": ms_eager / ms_triton,
-        "speedup_vs_compiled": ms_compiled / ms_triton,
+        "speedup_vs_eager": speedup_vs_eager,
+        "speedup_vs_compile": speedup_vs_compile,
     }
 
 
-def generate_roofline_plots(
+def render_dark_mode_roofline_plots(
     token_counts: List[int],
-    results: List[Dict[str, float]],
+    results_gqa: List[Dict[str, float]],
+    results_mha: List[Dict[str, float]],
     peak_bw_gbps: float,
     device_name: str,
     output_path: str,
 ) -> None:
-    """Generate publication-quality roofline and speedup charts."""
-    import matplotlib.pyplot as plt
+    """Save high-resolution dark-mode dual-subplot figure."""
+    plt.style.use("dark_background")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), dpi=300)
 
-    bw_eager = [r["bw_eager"] for r in results]
-    bw_compiled = [r["bw_compiled"] for r in results]
-    bw_triton = [r["bw_triton"] for r in results]
-    speedup_eager = [r["speedup_vs_eager"] for r in results]
-    speedup_compiled = [r["speedup_vs_compiled"] for r in results]
+    # Styling colors
+    color_gqa_triton = "#00f0ff"    # Vibrant Cyan
+    color_mha_triton = "#39ff14"    # Neon Green
+    color_compiled = "#ff9900"      # Amber
+    color_eager = "#ff3366"         # Crimson
+    color_peak = "#888888"          # Neutral Gray
 
-    plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5), dpi=300)
-
-    # Plot 1: Effective Memory Bandwidth (GB/s) vs Sequence Length
-    ax1.plot(token_counts, bw_triton, "o-", color="#1f77b4", linewidth=2.5, label="SpecCache Fused Triton")
-    ax1.plot(token_counts, bw_compiled, "s--", color="#2ca02c", linewidth=2.0, label="torch.compile")
-    ax1.plot(token_counts, bw_eager, "^:", color="#d62728", linewidth=1.8, label="Eager PyTorch (Un-fused)")
-
-    ax1.axhline(
-        peak_bw_gbps,
-        color="#7f7f7f",
-        linestyle="--",
-        linewidth=1.5,
-        label=f"Hardware Peak Roofline ({peak_bw_gbps:.0f} GB/s)",
+    # Subplot 1: Speedup vs. Sequence Length
+    ax1.plot(
+        token_counts,
+        [r["speedup_vs_eager"] for r in results_gqa],
+        "o-",
+        color=color_gqa_triton,
+        linewidth=2.5,
+        markersize=6,
+        label="Triton Fused vs Eager (GQA H=8)",
     )
+    ax1.plot(
+        token_counts,
+        [r["speedup_vs_eager"] for r in results_mha],
+        "s-",
+        color=color_mha_triton,
+        linewidth=2.5,
+        markersize=6,
+        label="Triton Fused vs Eager (MHA H=32)",
+    )
+    ax1.plot(
+        token_counts,
+        [r["speedup_vs_compile"] for r in results_gqa],
+        "^--",
+        color=color_compiled,
+        linewidth=1.8,
+        markersize=5,
+        label="Triton vs torch.compile (GQA H=8)",
+    )
+    ax1.axhline(1.0, color="#555555", linestyle=":", linewidth=1.2, label="1.0x Baseline")
 
     ax1.set_xscale("log", base=2)
-    ax1.set_xlabel("Sequence Length (Tokens)", fontsize=11, fontweight="bold")
-    ax1.set_ylabel("Effective Memory Bandwidth (GB/s)", fontsize=11, fontweight="bold")
-    ax1.set_title(f"HBM Memory Bandwidth Scaling ({device_name})", fontsize=12, fontweight="bold")
+    ax1.set_xlabel("Sequence Length T (Tokens)", fontsize=11, fontweight="bold", color="#e0e0e0")
+    ax1.set_ylabel("Speedup Multiplier (x)", fontsize=11, fontweight="bold", color="#e0e0e0")
+    ax1.set_title("Relative Speedup vs Sequence Length", fontsize=12, fontweight="bold", color="#ffffff")
     ax1.set_xticks(token_counts)
-    ax1.set_xticklabels([str(t) for t in token_counts], rotation=45)
-    ax1.legend(frameon=True, loc="lower right")
-    ax1.grid(True, linestyle="--", alpha=0.6)
+    ax1.set_xticklabels([str(t) for t in token_counts], rotation=45, color="#e0e0e0")
+    ax1.legend(frameon=True, facecolor="#1e1e1e", edgecolor="#333333", loc="upper left")
+    ax1.grid(True, linestyle="--", alpha=0.3, color="#444444")
 
-    # Plot 2: Speedup Ratio vs Sequence Length
-    ax2.plot(token_counts, speedup_eager, "o-", color="#1f77b4", linewidth=2.5, label="Speedup vs Eager PyTorch")
-    ax2.plot(token_counts, speedup_compiled, "s--", color="#ff7f0e", linewidth=2.0, label="Speedup vs torch.compile")
-    ax2.axhline(1.0, color="#7f7f7f", linestyle=":", linewidth=1.2)
+    # Subplot 2: Effective Memory Bandwidth (GB/s) vs. Sequence Length
+    ax2.plot(
+        token_counts,
+        [r["bw_triton"] for r in results_gqa],
+        "o-",
+        color=color_gqa_triton,
+        linewidth=2.5,
+        markersize=6,
+        label="Triton Fused (GQA H=8)",
+    )
+    ax2.plot(
+        token_counts,
+        [r["bw_triton"] for r in results_mha],
+        "s-",
+        color=color_mha_triton,
+        linewidth=2.5,
+        markersize=6,
+        label="Triton Fused (MHA H=32)",
+    )
+    ax2.plot(
+        token_counts,
+        [r["bw_compiled"] for r in results_gqa],
+        "^--",
+        color=color_compiled,
+        linewidth=1.8,
+        markersize=5,
+        label="torch.compile (GQA H=8)",
+    )
+    ax2.plot(
+        token_counts,
+        [r["bw_eager"] for r in results_gqa],
+        "x:",
+        color=color_eager,
+        linewidth=1.6,
+        markersize=5,
+        label="PyTorch Eager (GQA H=8)",
+    )
+    ax2.axhline(
+        peak_bw_gbps,
+        color=color_peak,
+        linestyle="--",
+        linewidth=1.5,
+        label=f"Peak HBM Roofline ({peak_bw_gbps:.0f} GB/s)",
+    )
 
     ax2.set_xscale("log", base=2)
-    ax2.set_xlabel("Sequence Length (Tokens)", fontsize=11, fontweight="bold")
-    ax2.set_ylabel("Speedup Multiplier (x)", fontsize=11, fontweight="bold")
-    ax2.set_title("Relative Acceleration across Sequence Lengths", fontsize=12, fontweight="bold")
+    ax2.set_xlabel("Sequence Length T (Tokens)", fontsize=11, fontweight="bold", color="#e0e0e0")
+    ax2.set_ylabel("Effective Bandwidth (GB/s)", fontsize=11, fontweight="bold", color="#e0e0e0")
+    ax2.set_title(f"Memory Bandwidth Scaling ({device_name})", fontsize=12, fontweight="bold", color="#ffffff")
     ax2.set_xticks(token_counts)
-    ax2.set_xticklabels([str(t) for t in token_counts], rotation=45)
-    ax2.legend(frameon=True, loc="upper left")
-    ax2.grid(True, linestyle="--", alpha=0.6)
+    ax2.set_xticklabels([str(t) for t in token_counts], rotation=45, color="#e0e0e0")
+    ax2.legend(frameon=True, facecolor="#1e1e1e", edgecolor="#333333", loc="lower right")
+    ax2.grid(True, linestyle="--", alpha=0.3, color="#444444")
 
     plt.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="#121212")
     plt.close(fig)
 
 
+def print_markdown_table(
+    config_name: str,
+    results: List[Dict[str, float]],
+    peak_bw: float,
+) -> None:
+    """Print clean formatted Markdown table to stdout."""
+    print(f"\n### Benchmark Results: {config_name}")
+    print("| Sequence Length (T) | Eager (us) | Compile (us) | Triton (us) | Speedup vs Eager | Effective GB/s | % Peak HBM |")
+    print("|---:|---:|---:|---:|---:|---:|---:|")
+    for r in results:
+        pct_peak = (r["bw_triton"] / peak_bw) * 100.0
+        print(
+            f"| {r['tokens']:>19} "
+            f"| {r['us_eager']:>10.1f} "
+            f"| {r['us_compiled']:>12.1f} "
+            f"| {r['us_triton']:>11.1f} "
+            f"| {r['speedup_vs_eager']:>15.2f}x "
+            f"| {r['bw_triton']:>14.1f} "
+            f"| {pct_peak:>9.1f}% |"
+        )
+
+
 def main():
-    parser = argparse.ArgumentParser(description="SpecCache Phase 1 HBM Roofline Benchmark")
-    parser.add_argument("--num-heads", type=int, default=8, help="Number of KV heads (default 8 for GQA)")
-    parser.add_argument("--head-dim", type=int, default=128, help="Head dimension (default 128 for Llama 3)")
+    parser = argparse.ArgumentParser(description="SpecCache Phase 1 Roofline Benchmark")
     parser.add_argument(
         "--tokens",
         type=int,
         nargs="+",
-        default=[512, 1024, 2048, 4096, 8192, 16384, 32768],
-        help="Sequence lengths to evaluate",
+        default=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+        help="Sequence lengths to benchmark",
     )
-    parser.add_argument("--peak-bw", type=float, default=None, help="Theoretical peak GPU HBM BW in GB/s")
-    parser.add_argument("--output-plot", type=str, default="benchmarks/roofline_results.png", help="Path for PNG plot")
+    parser.add_argument("--peak-bw", type=float, default=None, help="Theoretical peak GPU memory BW in GB/s")
+    parser.add_argument("--output-plot", type=str, default="benchmarks/phase1_roofline.png", help="Output PNG path")
     parser.add_argument("--device", type=str, default="cuda:0", help="Torch device")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         print("CUDA is not available on this system.")
-        print("SpecCache Triton benchmarks require an NVIDIA GPU runtime (e.g. Google Colab or cloud GPU).")
+        print("Please run this benchmark on an NVIDIA GPU runtime (e.g. Google Colab with T4/L4/A100).")
         return
 
     device = torch.device(args.device)
     device_name = torch.cuda.get_device_name(device)
-    peak_bw = args.peak_bw if args.peak_bw is not None else detect_peak_bandwidth(device_name)
+    peak_bw = args.peak_bw if args.peak_bw is not None else detect_peak_hbm_bandwidth(device_name)
 
     print("=" * 80)
-    print("SpecCache Phase 1: Hardware-Aware Fused RoPE KV-Cache Roofline Benchmark")
-    print(f"Device: {device_name}")
-    print(f"Hardware Peak Memory Bandwidth: {peak_bw:.1f} GB/s")
-    print(f"Configuration: Heads={args.num_heads}, Head Dim={args.head_dim}")
+    print("SpecCache Phase 1: Fused INT8 Dequantization + Relative RoPE Roofline Benchmark")
+    print(f"Device: {device_name} (Theoretical Peak HBM: {peak_bw:.1f} GB/s)")
     print("=" * 80)
-    header = (
-        f"{'Tokens':>8} | {'Eager (ms)':>10} {'Compile (ms)':>12} {'Triton (ms)':>11} | "
-        f"{'Triton GB/s':>11} {'% Peak':>7} | {'Speedup (Eager)':>15}"
-    )
-    print(header)
-    print("-" * len(header))
 
-    results: List[Dict[str, float]] = []
+    # 1. Llama-3-8B GQA Config (H=8, D=128)
+    print("\nRunning Llama-3-8B GQA configuration (H=8, D=128)...")
+    results_gqa: List[Dict[str, float]] = []
     for t in args.tokens:
-        res = run_benchmark_for_shape(t, args.num_heads, args.head_dim, device)
-        results.append(res)
-        pct_peak = (res["bw_triton"] / peak_bw) * 100.0
+        res = benchmark_single_configuration(t, h=8, d=128, device=device)
+        results_gqa.append(res)
+    print_markdown_table("Llama-3-8B GQA (H=8, D=128)", results_gqa, peak_bw)
 
-        print(
-            f"{t:>8} | {res['ms_eager']:>10.3f} {res['ms_compiled']:>12.3f} {res['ms_triton']:>11.3f} | "
-            f"{res['bw_triton']:>11.1f} {pct_peak:>6.1f}% | {res['speedup_vs_eager']:>14.2f}x"
-        )
+    # 2. 70B / MHA Config (H=32, D=128)
+    print("\nRunning 70B / MHA configuration (H=32, D=128)...")
+    results_mha: List[Dict[str, float]] = []
+    for t in args.tokens:
+        res = benchmark_single_configuration(t, h=32, d=128, device=device)
+        results_mha.append(res)
+    print_markdown_table("70B / MHA (H=32, D=128)", results_mha, peak_bw)
 
-    print("=" * 80)
-    print(f"Generating roofline plot -> {args.output_plot}")
-    generate_roofline_plots(args.tokens, results, peak_bw, device_name, args.output_plot)
-    print("Benchmark complete.")
+    # 3. Generate high-resolution dark-mode dual-subplot figure
+    print(f"\nSaving dark-mode roofline plot to: {args.output_plot}")
+    render_dark_mode_roofline_plots(args.tokens, results_gqa, results_mha, peak_bw, device_name, args.output_plot)
+    print("Roofline benchmark complete.")
 
 
 if __name__ == "__main__":
