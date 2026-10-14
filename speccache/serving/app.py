@@ -95,7 +95,8 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
             text = " ".join(m.content for m in req.messages)
         if not text:
             return [1, 2, 3, 4]  # Default synthetic tokens
-        return [abs(hash(w)) % 1000 + 1 for w in text.split()]
+        v_size = getattr(app.state.runner.model, "vocab_size", 32000)
+        return [abs(hash(w)) % max(v_size - 1, 1) + 1 for w in text.split()]
 
     def _update_stats(metrics: InferenceMetrics) -> None:
         stats = app.state.stats

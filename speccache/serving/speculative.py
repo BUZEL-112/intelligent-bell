@@ -252,10 +252,13 @@ class SpeculativeVerifier:
     def rollback_cache(
         self,
         cache: SpecDynamicCache,
-        target_seq_len: int,
+        target_seq_len: Optional[int] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> None:
-        """Roll back KV cache to target_seq_len, discarding rejected speculative candidate positions."""
-        cache.truncate(target_seq_len)
+        """Roll back KV cache, discarding rejected speculative candidate positions."""
+        seq_len = target_seq_len if target_seq_len is not None else valid_seq_len
+        if seq_len is not None:
+            cache.truncate(seq_len)
 
     def verify_and_rollback(
         self,
