@@ -12,19 +12,21 @@ Provides:
 - Integer metadata tracking original token start positions (p_cached) for relative RoPE.
 """
 
-from collections import OrderedDict
-from dataclasses import dataclass, field
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from collections import OrderedDict
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
 import torch
 
 
 @dataclass
 class OriginalPositionMetadata:
     """Metadata tracking a cached KV block inside the pinned host pool."""
+
     block_id: int
     start_pos: int
-    token_ids: Tuple[int, ...] = field(default_factory=tuple)
+    token_ids: tuple[int, ...] = field(default_factory=tuple)
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
 
@@ -46,7 +48,7 @@ class PinnedKVPool:
         chunk_size: int,
         num_heads: int,
         head_dim: int,
-        on_evict_callback: Optional[Callable[[int], None]] = None,
+        on_evict_callback: Callable[[int], None] | None = None,
     ) -> None:
         """Initialize page-locked host memory pool.
 
@@ -107,7 +109,7 @@ class PinnedKVPool:
                 self._is_pinned = False
 
         # Slab allocator: free slot stack
-        self._free_block_ids: List[int] = list(range(max_blocks))
+        self._free_block_ids: list[int] = list(range(max_blocks))
 
         # O(1) LRU eviction tracking: block_id -> OriginalPositionMetadata
         self._active_lru: OrderedDict[int, OriginalPositionMetadata] = OrderedDict()
@@ -128,11 +130,11 @@ class PinnedKVPool:
         return len(self._free_block_ids)
 
     @property
-    def allocated_blocks(self) -> List[int]:
+    def allocated_blocks(self) -> list[int]:
         """List of active block IDs currently held in the pool."""
         return list(self._active_lru.keys())
 
-    def allocate(self, block_id: Optional[int] = None, start_pos: int = -1) -> int:
+    def allocate(self, block_id: int | None = None, start_pos: int = -1) -> int:
         """Allocate a block slot from the arena in O(1).
 
         If block_id is specified, reserves that slot directly.
@@ -184,14 +186,22 @@ class PinnedKVPool:
     def write_block(
         self,
         block_id: int,
-        k_q: torch.Tensor,
-        k_s: torch.Tensor,
-        v_q: torch.Tensor,
-        v_s: torch.Tensor,
-        start_pos: int,
-        token_ids: Optional[Tuple[int, ...]] = None,
+        k_q: torch.Tensor | None = None,
+        k_s: torch.Tensor | None = None,
+        v_q: torch.Tensor | None = None,
+        v_s: torch.Tensor | None = None,
+        start_pos: int = -1,
+        token_ids: tuple[int, ...] | None = None,
+        *,
+        k_quant: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_quant: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
     ) -> None:
         """Write quantized Key and Value tensors into the assigned block slot.
+
+        Supports positional parameters or keyword parameters with either
+        shorthand names (k_q, k_s, v_q, v_s) or full names (k_quant, k_scale, v_quant, v_scale).
 
         Args:
             block_id: Target block index in [0, max_blocks).
@@ -201,26 +211,38 @@ class PinnedKVPool:
             v_s: Scale factors [chunk_size, num_heads, 1], float16.
             start_pos: Original token start position p_cached.
             token_ids: Optional tuple of token IDs for this chunk.
+            k_quant: Alias for k_q.
+            k_scale: Alias for k_s.
+            v_quant: Alias for v_q.
+            v_scale: Alias for v_s.
         """
         if block_id not in self._active_lru:
             raise KeyError(f"Block ID {block_id} is not an allocated active block.")
 
+        k_target = k_q if k_q is not None else k_quant
+        ks_target = k_s if k_s is not None else k_scale
+        v_target = v_q if v_q is not None else v_quant
+        vs_target = v_s if v_s is not None else v_scale
+
+        if k_target is None or ks_target is None or v_target is None or vs_target is None:
+            raise ValueError("Quantized key/value and scale factor tensors must be provided.")
+
         expected_kv_shape = (self.chunk_size, self.num_heads, self.head_dim)
         expected_s_shape = (self.chunk_size, self.num_heads, 1)
 
-        if k_q.shape != expected_kv_shape or k_q.dtype != torch.int8:
-            raise ValueError(f"k_q shape {k_q.shape} dtype {k_q.dtype} invalid.")
-        if k_s.shape != expected_s_shape or k_s.dtype != torch.float16:
-            raise ValueError(f"k_s shape {k_s.shape} dtype {k_s.dtype} invalid.")
-        if v_q.shape != expected_kv_shape or v_q.dtype != torch.int8:
-            raise ValueError(f"v_q shape {v_q.shape} dtype {v_q.dtype} invalid.")
-        if v_s.shape != expected_s_shape or v_s.dtype != torch.float16:
-            raise ValueError(f"v_s shape {v_s.shape} dtype {v_s.dtype} invalid.")
+        if k_target.shape != expected_kv_shape or k_target.dtype != torch.int8:
+            raise ValueError(f"k_q shape {k_target.shape} dtype {k_target.dtype} invalid.")
+        if ks_target.shape != expected_s_shape or ks_target.dtype != torch.float16:
+            raise ValueError(f"k_s shape {ks_target.shape} dtype {ks_target.dtype} invalid.")
+        if v_target.shape != expected_kv_shape or v_target.dtype != torch.int8:
+            raise ValueError(f"v_q shape {v_target.shape} dtype {v_target.dtype} invalid.")
+        if vs_target.shape != expected_s_shape or vs_target.dtype != torch.float16:
+            raise ValueError(f"v_s shape {vs_target.shape} dtype {vs_target.dtype} invalid.")
 
-        self.k_quant[block_id].copy_(k_q, non_blocking=False)
-        self.k_scale[block_id].copy_(k_s, non_blocking=False)
-        self.v_quant[block_id].copy_(v_q, non_blocking=False)
-        self.v_scale[block_id].copy_(v_s, non_blocking=False)
+        self.k_quant[block_id].copy_(k_target, non_blocking=False)
+        self.k_scale[block_id].copy_(ks_target, non_blocking=False)
+        self.v_quant[block_id].copy_(v_target, non_blocking=False)
+        self.v_scale[block_id].copy_(vs_target, non_blocking=False)
         self.original_start_pos[block_id] = start_pos
 
         meta = self._active_lru[block_id]
@@ -232,7 +254,7 @@ class PinnedKVPool:
     def get_block_views(
         self,
         block_id: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return zero-copy slice views into pinned host slabs for DMA transfer.
 
         Args:

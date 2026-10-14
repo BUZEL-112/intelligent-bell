@@ -18,41 +18,32 @@ Verifies:
    - /v1/stats (Cache hit rates, pinned pool utilization %, mean TTFT savings).
 """
 
-from typing import List, Tuple
-import numpy as np
 import pytest
 import torch
 
 from speccache.cache.engine import SpecCacheEngine
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
-    dequant_value_ref,
-    pytorch_eager_dequant_rope_shift,
     quantize_kv_int8,
     rotate_half,
 )
 from speccache.serving.app import create_app
 from speccache.serving.kv_injector import (
-    KVInjector,
     MultiLayerKVInjector,
     SpecDynamicCache,
 )
 from speccache.serving.pipeline import (
-    InferenceMetrics,
     MockL4TransformerEngine,
-    RoutePath,
     SpecCacheLLMRunner,
 )
 from speccache.serving.speculative import (
-    SpeculativeDraft,
     SpeculativeVerifier,
-    VerificationResult,
 )
-
 
 # ==============================================================================
 # Requirement E.1: Lossless Speculative Verification Test
 # ==============================================================================
+
 
 def test_lossless_speculative_verification():
     """Prove that SpeculativeVerifier matches 5 sequential greedy autoregression steps.
@@ -79,7 +70,7 @@ def test_lossless_speculative_verification():
     prompt = [10, 20, 30, 40]
 
     # Step 1: Run 5 sequential greedy autoregressive steps to get ground truth
-    sequential_tokens: List[int] = []
+    sequential_tokens: list[int] = []
     seq_cache = SpecDynamicCache()
 
     # Step 1.1: Initial prompt prefill -> emits token 1
@@ -142,6 +133,7 @@ def test_lossless_speculative_verification():
 # Requirement E.2: Multi-Layer Shifted KV Injection Test
 # ==============================================================================
 
+
 def test_multi_layer_shifted_kv_injection():
     """Verify caching a multi-layer prompt at offset 256 and injecting at offset 0 produces valid shifted KV."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -165,8 +157,8 @@ def test_multi_layer_shifted_kv_injection():
 
     # Generate synthetic unrotated keys and values for all layers
     torch.manual_seed(123)
-    raw_keys: List[torch.Tensor] = []
-    raw_vals: List[torch.Tensor] = []
+    raw_keys: list[torch.Tensor] = []
+    raw_vals: list[torch.Tensor] = []
 
     cos_256, sin_256 = compute_rope_cos_sin_delta(
         torch.tensor([p_cached], device=device), head_dim=head_dim, device=device
@@ -175,9 +167,13 @@ def test_multi_layer_shifted_kv_injection():
     sin_256_full = torch.cat([sin_256, sin_256], dim=-1)[:, None, :]
 
     block_id = 0
-    for l in range(num_layers):
-        k_raw = torch.randn((chunk_size, num_kv_heads, head_dim), dtype=torch.float32, device=device)
-        v_raw = torch.randn((chunk_size, num_kv_heads, head_dim), dtype=torch.float32, device=device)
+    for layer_idx in range(num_layers):
+        k_raw = torch.randn(
+            (chunk_size, num_kv_heads, head_dim), dtype=torch.float32, device=device
+        )
+        v_raw = torch.randn(
+            (chunk_size, num_kv_heads, head_dim), dtype=torch.float32, device=device
+        )
         raw_keys.append(k_raw)
         raw_vals.append(v_raw)
 
@@ -189,8 +185,8 @@ def test_multi_layer_shifted_kv_injection():
         vq, vs = quantize_kv_int8(v_raw)
 
         # Write to layer pool
-        injector.layer_pools[l].allocate(block_id=block_id, start_pos=p_cached)
-        injector.layer_pools[l].write_block(
+        injector.layer_pools[layer_idx].allocate(block_id=block_id, start_pos=p_cached)
+        injector.layer_pools[layer_idx].write_block(
             block_id=block_id,
             k_quant=kq.cpu(),
             k_scale=ks.cpu(),
@@ -211,16 +207,16 @@ def test_multi_layer_shifted_kv_injection():
     assert len(cache) == num_layers
     assert len(legacy_cache) == num_layers
 
-    for l in range(num_layers):
-        k_cached = cache[l][0]  # [1, H, T, D]
-        v_cached = cache[l][1]  # [1, H, T, D]
+    for layer_idx in range(num_layers):
+        k_cached = cache[layer_idx][0]  # [1, H, T, D]
+        v_cached = cache[layer_idx][1]  # [1, H, T, D]
 
         assert k_cached.shape == (1, num_kv_heads, chunk_size, head_dim)
         assert v_cached.shape == (1, num_kv_heads, chunk_size, head_dim)
 
         # Reference shifted keys: raw key rotated back to position 0 equals raw key
-        k_expected = raw_keys[l].to(torch.float16).permute(1, 0, 2).unsqueeze(0)
-        v_expected = raw_vals[l].to(torch.float16).permute(1, 0, 2).unsqueeze(0)
+        k_expected = raw_keys[layer_idx].to(torch.float16).permute(1, 0, 2).unsqueeze(0)
+        v_expected = raw_vals[layer_idx].to(torch.float16).permute(1, 0, 2).unsqueeze(0)
 
         # Verify values match within quantization tolerance
         torch.testing.assert_close(
@@ -242,6 +238,7 @@ def test_multi_layer_shifted_kv_injection():
 # ==============================================================================
 # Requirement E.3: FastAPI Endpoints Test
 # ==============================================================================
+
 
 @pytest.fixture
 def mock_serving_app():
@@ -340,6 +337,7 @@ def test_fastapi_endpoints(mock_serving_app):
 # ==============================================================================
 # Additional Coverage: SpecDynamicCache Unit Tests
 # ==============================================================================
+
 
 def test_dynamic_cache_truncation_and_legacy():
     """Verify cache truncation and round-trip conversion."""
