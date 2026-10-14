@@ -7,18 +7,20 @@ Implements ChunkRadixTree:
 - Handles clean node pruning when PinnedKVPool evicts a block_id.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Optional
 
 
 @dataclass
 class RadixMatchResult:
     """Result returned when a token sequence or prefix matches in the Radix tree."""
+
     block_id: int
     cached_position: int
-    token_ids: Tuple[int, ...]
+    token_ids: tuple[int, ...]
     matched_length: int
-    continuation_tokens: List[int] = field(default_factory=list)
+    continuation_tokens: list[int] = field(default_factory=list)
 
 
 class ChunkRadixNode:
@@ -26,9 +28,9 @@ class ChunkRadixNode:
 
     def __init__(
         self,
-        chunk_tokens: Tuple[int, ...],
+        chunk_tokens: tuple[int, ...],
         parent: Optional["ChunkRadixNode"] = None,
-        block_id: Optional[int] = None,
+        block_id: int | None = None,
         cached_position: int = 0,
     ) -> None:
         self.chunk_tokens = chunk_tokens
@@ -36,7 +38,7 @@ class ChunkRadixNode:
         self.block_id = block_id
         self.cached_position = cached_position
         # Child nodes keyed by their chunk_tokens tuple for exact chunk matching
-        self.children: Dict[Tuple[int, ...], ChunkRadixNode] = {}
+        self.children: dict[tuple[int, ...], ChunkRadixNode] = {}
 
     @property
     def is_leaf(self) -> bool:
@@ -58,7 +60,7 @@ class ChunkRadixTree:
         self.chunk_size = chunk_size
         self.root = ChunkRadixNode(chunk_tokens=())
         # Reverse map for O(1) eviction: block_id -> set of ChunkRadixNode
-        self._block_to_nodes: Dict[int, List[ChunkRadixNode]] = {}
+        self._block_to_nodes: dict[int, list[ChunkRadixNode]] = {}
         self._total_blocks = 0
 
     def __len__(self) -> int:
@@ -68,7 +70,7 @@ class ChunkRadixTree:
     def insert(
         self,
         token_ids: Sequence[int],
-        block_ids: Union[int, Sequence[int]],
+        block_ids: int | Sequence[int],
         cached_position: int = 0,
     ) -> None:
         """Insert token sequence mapped to block_ids along the prefix tree.
@@ -132,7 +134,7 @@ class ChunkRadixTree:
                 self._total_blocks += 1
                 curr = new_node
 
-    def match_prefix(self, token_ids: Sequence[int]) -> List[Tuple[int, int]]:
+    def match_prefix(self, token_ids: Sequence[int]) -> list[tuple[int, int]]:
         """Match as many contiguous chunks as possible from the prefix of token_ids.
 
         Args:
@@ -143,7 +145,7 @@ class ChunkRadixTree:
         """
         tokens = list(token_ids)
         num_chunks = len(tokens) // self.chunk_size
-        matches: List[Tuple[int, int]] = []
+        matches: list[tuple[int, int]] = []
 
         curr = self.root
         for c in range(num_chunks):
@@ -160,7 +162,7 @@ class ChunkRadixTree:
 
         return matches
 
-    def match_exact(self, chunk_tokens: Sequence[int]) -> Optional[RadixMatchResult]:
+    def match_exact(self, chunk_tokens: Sequence[int]) -> RadixMatchResult | None:
         """Look up a single exact chunk in the root's immediate children."""
         toks = tuple(chunk_tokens)
         if len(toks) != self.chunk_size:

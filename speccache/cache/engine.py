@@ -10,18 +10,18 @@ Integrates:
   and Triton kernel execution on dedicated CUDA streams.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+
 import numpy as np
 import torch
 
-from speccache.cache.pinned_pool import OriginalPositionMetadata, PinnedKVPool
-from speccache.cache.radix_index import ChunkRadixTree, RadixMatchResult
+from speccache.cache.pinned_pool import PinnedKVPool
+from speccache.cache.radix_index import ChunkRadixTree
 from speccache.cache.semantic_index import (
     RouteDecision,
     SemanticHNSWIndex,
-    SemanticLookupResult,
 )
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
@@ -38,28 +38,34 @@ try:
 except ImportError:
     TRITON_AVAILABLE = False
 
+from speccache.utils import get_logger
+
+logger = get_logger(__name__)
+
 
 class ChunkRoutingStatus(str, Enum):
     """Routing state assigned to each prompt chunk."""
-    EXACT_REUSE = "EXACT_REUSE"              # Tier 1 exact Radix hit
-    SEMANTIC_REUSE = "SEMANTIC_REUSE"        # Tier 2 cosine similarity >= 0.92
+
+    EXACT_REUSE = "EXACT_REUSE"  # Tier 1 exact Radix hit
+    SEMANTIC_REUSE = "SEMANTIC_REUSE"  # Tier 2 cosine similarity >= 0.92
     SPECULATIVE_DRAFT = "SPECULATIVE_DRAFT"  # Tier 2 0.80 <= similarity < 0.92
-    CACHE_MISS = "CACHE_MISS"                # Similarity < 0.80
+    CACHE_MISS = "CACHE_MISS"  # Similarity < 0.80
 
 
 @dataclass
 class ChunkRoutingDecision:
     """Routing decision and transfer metadata for a single prompt chunk."""
+
     chunk_index: int
     target_start_pos: int
     target_end_pos: int
-    token_ids: Tuple[int, ...]
+    token_ids: tuple[int, ...]
     status: ChunkRoutingStatus
     similarity: float = 0.0
-    block_id: Optional[int] = None
-    cached_position: Optional[int] = None
+    block_id: int | None = None
+    cached_position: int | None = None
     delta_p: int = 0
-    continuation_tokens: List[int] = field(default_factory=list)
+    continuation_tokens: list[int] = field(default_factory=list)
 
 
 class SpecCacheEngine:
@@ -74,7 +80,7 @@ class SpecCacheEngine:
         embedding_dim: int = 128,
         tau_reuse: float = 0.92,
         tau_spec: float = 0.80,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
         force_fallback_semantic: bool = False,
     ) -> None:
         """Initialize the SpecCache engine.
@@ -125,20 +131,44 @@ class SpecCacheEngine:
             self.transfer_stream = torch.cuda.Stream(device=self.device)
             self.compute_stream = torch.cuda.Stream(device=self.device)
             self._stage_k_quant = [
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
             ]
             self._stage_k_scale = [
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
             ]
             self._stage_v_quant = [
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
             ]
             self._stage_v_scale = [
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
             ]
         else:
             self.transfer_stream = None
@@ -161,8 +191,8 @@ class SpecCacheEngine:
         k_scale: torch.Tensor,
         v_quant: torch.Tensor,
         v_scale: torch.Tensor,
-        embedding: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        continuation_tokens: Optional[List[int]] = None,
+        embedding: np.ndarray | torch.Tensor | None = None,
+        continuation_tokens: list[int] | None = None,
     ) -> int:
         """Register a new quantized INT8 KV chunk into the host cache and indices.
 
@@ -212,16 +242,23 @@ class SpecCacheEngine:
                 continuation_tokens=continuation_tokens,
             )
 
+        logger.debug(
+            "register_chunk: block_id=%d cached_position=%d has_embedding=%s",
+            block_id,
+            cached_position,
+            embedding is not None,
+        )
+
         return block_id
 
     def retrieve_and_reconstruct_kv(
         self,
         chunks_tokens: Sequence[Sequence[int]],
-        chunks_embeddings: Optional[Sequence[Union[np.ndarray, torch.Tensor]]] = None,
-        target_positions: Optional[Sequence[int]] = None,
-        cos_table: Optional[torch.Tensor] = None,
-        sin_table: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[ChunkRoutingDecision]]:
+        chunks_embeddings: Sequence[np.ndarray | torch.Tensor] | None = None,
+        target_positions: Sequence[int] | None = None,
+        cos_table: torch.Tensor | None = None,
+        sin_table: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[ChunkRoutingDecision]]:
         """Retrieve cached blocks via two-tier routing and reconstruct GPU FP16 KV caches.
 
         Executes:
@@ -243,12 +280,16 @@ class SpecCacheEngine:
         if target_positions is None:
             target_positions = [c * self.chunk_size for c in range(num_chunks)]
 
-        decisions: List[ChunkRoutingDecision] = []
+        decisions: list[ChunkRoutingDecision] = []
 
         for i in range(num_chunks):
             c_toks = tuple(chunks_tokens[i])
             p_target = target_positions[i]
-            emb = chunks_embeddings[i] if chunks_embeddings is not None and i < len(chunks_embeddings) else None
+            emb = (
+                chunks_embeddings[i]
+                if chunks_embeddings is not None and i < len(chunks_embeddings)
+                else None
+            )
 
             # ------------------------------------------------------------------
             # Tier 1: Token-Level Radix Tree Exact Match
@@ -280,7 +321,11 @@ class SpecCacheEngine:
                 sem_res = self.semantic_index.search(emb)
 
                 if sem_res.action == RouteDecision.EXACT_OR_REUSE and sem_res.block_id is not None:
-                    p_cached = sem_res.cached_position if sem_res.cached_position is not None else self.pool.get_start_pos(sem_res.block_id)
+                    p_cached = (
+                        sem_res.cached_position
+                        if sem_res.cached_position is not None
+                        else self.pool.get_start_pos(sem_res.block_id)
+                    )
                     delta_p = p_target - p_cached
                     decisions.append(
                         ChunkRoutingDecision(
@@ -335,18 +380,29 @@ class SpecCacheEngine:
 
         # Execute Double-Buffered Asynchronous DMA + Triton Kernel Pipelining
         reused_chunks = [
-            d for d in decisions
+            d
+            for d in decisions
             if d.status in (ChunkRoutingStatus.EXACT_REUSE, ChunkRoutingStatus.SEMANTIC_REUSE)
             and d.block_id is not None
         ]
 
         if not reused_chunks:
-            empty = torch.empty((0, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+            empty = torch.empty(
+                (0, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device
+            )
             return empty, empty, decisions
 
         total_tokens = len(reused_chunks) * self.chunk_size
-        k_out = torch.empty((total_tokens, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
-        v_out = torch.empty((total_tokens, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+        k_out = torch.empty(
+            (total_tokens, self.num_kv_heads, self.head_dim),
+            dtype=torch.float16,
+            device=self.device,
+        )
+        v_out = torch.empty(
+            (total_tokens, self.num_kv_heads, self.head_dim),
+            dtype=torch.float16,
+            device=self.device,
+        )
 
         k_reconstructed, v_reconstructed = self.execute_async_dma_and_rope(
             reused_decisions=reused_chunks,
@@ -354,17 +410,26 @@ class SpecCacheEngine:
             dest_v_out=v_out,
         )
 
+        logger.debug(
+            "retrieve_and_reconstruct_kv: chunks=%d reused=%d tokens=%d",
+            len(chunks_tokens),
+            len(reused_chunks),
+            total_tokens,
+        )
+
         return k_reconstructed, v_reconstructed, decisions
 
     def lookup_chunks(
         self,
         prompt_tokens: Sequence[int],
-        chunk_embeddings: Optional[Sequence[Union[np.ndarray, torch.Tensor]]] = None,
-    ) -> List[ChunkRoutingDecision]:
+        chunk_embeddings: Sequence[np.ndarray | torch.Tensor] | None = None,
+    ) -> list[ChunkRoutingDecision]:
         """Convenience method chunking prompt_tokens and querying indices."""
         tokens = list(prompt_tokens)
         num_chunks = len(tokens) // self.chunk_size
-        chunks_tokens = [tokens[c * self.chunk_size : (c + 1) * self.chunk_size] for c in range(num_chunks)]
+        chunks_tokens = [
+            tokens[c * self.chunk_size : (c + 1) * self.chunk_size] for c in range(num_chunks)
+        ]
         target_positions = [c * self.chunk_size for c in range(num_chunks)]
         _, _, decisions = self.retrieve_and_reconstruct_kv(
             chunks_tokens=chunks_tokens,
@@ -375,28 +440,39 @@ class SpecCacheEngine:
 
     def execute_async_dma_and_rope(
         self,
-        reused_decisions: List[ChunkRoutingDecision],
-        dest_k_out: Optional[torch.Tensor] = None,
-        dest_v_out: Optional[torch.Tensor] = None,
+        reused_decisions: list[ChunkRoutingDecision],
+        dest_k_out: torch.Tensor | None = None,
+        dest_v_out: torch.Tensor | None = None,
         sync: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Double-buffered asynchronous PCIe DMA pipeline overlapping transfer with Triton kernel."""
         valid_chunks = [
-            d for d in reused_decisions
+            d
+            for d in reused_decisions
             if d.status in (ChunkRoutingStatus.EXACT_REUSE, ChunkRoutingStatus.SEMANTIC_REUSE)
             and d.block_id is not None
         ]
 
         if not valid_chunks:
-            empty = torch.empty((0, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+            empty = torch.empty(
+                (0, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device
+            )
             return empty, empty
 
         total_tokens = len(valid_chunks) * self.chunk_size
 
         if dest_k_out is None:
-            dest_k_out = torch.empty((total_tokens, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+            dest_k_out = torch.empty(
+                (total_tokens, self.num_kv_heads, self.head_dim),
+                dtype=torch.float16,
+                device=self.device,
+            )
         if dest_v_out is None:
-            dest_v_out = torch.empty((total_tokens, self.num_kv_heads, self.head_dim), dtype=torch.float16, device=self.device)
+            dest_v_out = torch.empty(
+                (total_tokens, self.num_kv_heads, self.head_dim),
+                dtype=torch.float16,
+                device=self.device,
+            )
 
         if not self._is_cuda or not TRITON_AVAILABLE:
             return self._execute_cpu_fallback(valid_chunks, dest_k_out, dest_v_out)
@@ -404,25 +480,50 @@ class SpecCacheEngine:
         num_chunks = len(valid_chunks)
 
         # Ensure staging buffers are initialized and match current geometry
-        if (
-            self._stage_k_quant is None
-            or self._stage_k_quant[0].shape != (self.chunk_size, self.num_kv_heads, self.head_dim)
+        if self._stage_k_quant is None or self._stage_k_quant[0].shape != (
+            self.chunk_size,
+            self.num_kv_heads,
+            self.head_dim,
         ):
             self._stage_k_quant = [
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
             ]
             self._stage_k_scale = [
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
             ]
             self._stage_v_quant = [
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, self.head_dim), dtype=torch.int8, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, self.head_dim),
+                    dtype=torch.int8,
+                    device=self.device,
+                ),
             ]
             self._stage_v_scale = [
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
-                torch.empty((self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
+                torch.empty(
+                    (self.chunk_size, self.num_kv_heads, 1), dtype=torch.float16, device=self.device
+                ),
             ]
 
         # Precompute RoPE cos/sin factor tables for all chunks in a single GPU operation
@@ -501,23 +602,27 @@ class SpecCacheEngine:
 
     def _execute_cpu_fallback(
         self,
-        valid_chunks: List[ChunkRoutingDecision],
+        valid_chunks: list[ChunkRoutingDecision],
         dest_k_out: torch.Tensor,
         dest_v_out: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """CPU fallback when CUDA or Triton is unavailable."""
         for i, meta in enumerate(valid_chunks):
             assert meta.block_id is not None
             k_q, k_s, v_q, v_s = self.pool.get_block_views(meta.block_id)
 
             delta_pos = torch.tensor([meta.delta_p], device=self.device)
-            cos_delta, sin_delta = compute_rope_cos_sin_delta(delta_pos, self.head_dim, device=self.device)
+            cos_delta, sin_delta = compute_rope_cos_sin_delta(
+                delta_pos, self.head_dim, device=self.device
+            )
 
             out_offset = i * self.chunk_size
             k_slice = dest_k_out[out_offset : out_offset + self.chunk_size]
             v_slice = dest_v_out[out_offset : out_offset + self.chunk_size]
 
-            pytorch_eager_dequant_rope_shift(k_q.to(self.device), k_s.to(self.device), cos_delta, sin_delta, out=k_slice)
+            pytorch_eager_dequant_rope_shift(
+                k_q.to(self.device), k_s.to(self.device), cos_delta, sin_delta, out=k_slice
+            )
             dequant_value_ref(v_q.to(self.device), v_s.to(self.device), out=v_slice)
 
         return dest_k_out, dest_v_out

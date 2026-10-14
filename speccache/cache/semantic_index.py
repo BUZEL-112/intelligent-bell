@@ -11,14 +11,16 @@ Implements SemanticHNSWIndex:
   * RouteDecision.MISS (< 0.80)
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+
 import numpy as np
 import torch
 
 try:
     import faiss
+
     FAISS_AVAILABLE = True
 except ImportError:
     FAISS_AVAILABLE = False
@@ -26,9 +28,10 @@ except ImportError:
 
 class RouteDecision(str, Enum):
     """Three-way routing classification for semantic query similarity."""
+
     EXACT_OR_REUSE = "EXACT_OR_REUSE"  # Similarity >= 0.92
-    SPECULATIVE = "SPECULATIVE"        # 0.80 <= Similarity < 0.92
-    MISS = "MISS"                      # Similarity < 0.80
+    SPECULATIVE = "SPECULATIVE"  # 0.80 <= Similarity < 0.92
+    MISS = "MISS"  # Similarity < 0.80
 
 
 # Backward compatibility aliases
@@ -41,23 +44,25 @@ RouteDecision.CACHE_MISS = RouteDecision.MISS  # type: ignore
 @dataclass
 class SemanticLookupResult:
     """Result returned by semantic index query."""
+
     action: RouteDecision
     similarity: float
-    block_id: Optional[int] = None
-    cached_position: Optional[int] = None
-    token_ids: Optional[Tuple[int, ...]] = None
-    continuation_tokens: List[int] = field(default_factory=list)
+    block_id: int | None = None
+    cached_position: int | None = None
+    token_ids: tuple[int, ...] | None = None
+    continuation_tokens: list[int] = field(default_factory=list)
 
 
 @dataclass
 class _VectorMeta:
     """Metadata for an indexed chunk vector."""
+
     label: int
     block_id: int
     cached_position: int
     is_active: bool = True
-    token_ids: Optional[Tuple[int, ...]] = None
-    continuation_tokens: List[int] = field(default_factory=list)
+    token_ids: tuple[int, ...] | None = None
+    continuation_tokens: list[int] = field(default_factory=list)
 
 
 class SemanticHNSWIndex:
@@ -87,7 +92,9 @@ class SemanticHNSWIndex:
             force_fallback: Force PyTorch normalized matrix search instead of FAISS.
         """
         if tau_spec >= tau_reuse:
-            raise ValueError(f"tau_spec ({tau_spec}) must be strictly less than tau_reuse ({tau_reuse}).")
+            raise ValueError(
+                f"tau_spec ({tau_spec}) must be strictly less than tau_reuse ({tau_reuse})."
+            )
 
         self.embed_dim = embed_dim
         self.max_elements = max_elements
@@ -108,9 +115,9 @@ class SemanticHNSWIndex:
             self._fallback_embeddings = torch.empty((0, embed_dim), dtype=torch.float32)
 
         # Mapping: sequential_label -> _VectorMeta
-        self._label_to_meta: Dict[int, _VectorMeta] = {}
+        self._label_to_meta: dict[int, _VectorMeta] = {}
         # Mapping: block_id -> sequential_label
-        self._block_to_label: Dict[int, int] = {}
+        self._block_to_label: dict[int, int] = {}
         self._next_label = 0
 
     @property
@@ -122,7 +129,7 @@ class SemanticHNSWIndex:
         """Number of active semantic vectors in the index."""
         return len(self._block_to_label)
 
-    def _normalize(self, vector: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    def _normalize(self, vector: np.ndarray | torch.Tensor) -> np.ndarray:
         """L2-normalize input embedding to unit sphere."""
         if isinstance(vector, torch.Tensor):
             arr = vector.detach().cpu().to(torch.float32).numpy()
@@ -138,11 +145,11 @@ class SemanticHNSWIndex:
 
     def add(
         self,
-        embedding: Union[np.ndarray, torch.Tensor],
+        embedding: np.ndarray | torch.Tensor,
         block_id: int,
         cached_position: int = 0,
-        token_ids: Optional[Sequence[int]] = None,
-        continuation_tokens: Optional[List[int]] = None,
+        token_ids: Sequence[int] | None = None,
+        continuation_tokens: list[int] | None = None,
     ) -> int:
         """L2-normalize and insert embedding vector into the HNSW index.
 
@@ -170,7 +177,9 @@ class SemanticHNSWIndex:
             cached_position=cached_position,
             is_active=True,
             token_ids=tuple(token_ids) if token_ids is not None else None,
-            continuation_tokens=list(continuation_tokens) if continuation_tokens is not None else [],
+            continuation_tokens=list(continuation_tokens)
+            if continuation_tokens is not None
+            else [],
         )
         self._label_to_meta[label] = meta
         self._block_to_label[block_id] = label
@@ -185,8 +194,8 @@ class SemanticHNSWIndex:
 
     def query(
         self,
-        embedding: Union[np.ndarray, torch.Tensor],
-    ) -> Tuple[RouteDecision, float, Optional[int], Optional[int]]:
+        embedding: np.ndarray | torch.Tensor,
+    ) -> tuple[RouteDecision, float, int | None, int | None]:
         """Query the index and classify match into RouteDecision.
 
         Returns:
@@ -197,7 +206,7 @@ class SemanticHNSWIndex:
 
     def search(
         self,
-        query_embedding: Union[np.ndarray, torch.Tensor],
+        query_embedding: np.ndarray | torch.Tensor,
     ) -> SemanticLookupResult:
         """Search the semantic index with cosine similarity threshold routing.
 
@@ -216,9 +225,9 @@ class SemanticHNSWIndex:
             top_k = min(16, self._index.ntotal)
             distances, indices = self._index.search(norm_query, top_k)
             best_sim = -1.0
-            best_meta: Optional[_VectorMeta] = None
+            best_meta: _VectorMeta | None = None
 
-            for sim, idx in zip(distances[0], indices[0]):
+            for sim, idx in zip(distances[0], indices[0], strict=True):
                 if idx in self._label_to_meta:
                     meta = self._label_to_meta[idx]
                     if meta.is_active:
@@ -231,7 +240,7 @@ class SemanticHNSWIndex:
             sorted_sims, sorted_indices = torch.sort(sims, descending=True)
             best_sim = -1.0
             best_meta = None
-            for s, idx in zip(sorted_sims.tolist(), sorted_indices.tolist()):
+            for s, idx in zip(sorted_sims.tolist(), sorted_indices.tolist(), strict=True):
                 if idx in self._label_to_meta and self._label_to_meta[idx].is_active:
                     best_sim = float(s)
                     best_meta = self._label_to_meta[idx]

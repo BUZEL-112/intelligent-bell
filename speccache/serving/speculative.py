@@ -7,35 +7,41 @@ parallel target-model verification forward pass, accepts the longest contiguous 
 prefix, and emits 1 bonus token from the target logits at the first mismatch index.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple, Union
+
 import torch
 
 from speccache.serving.kv_injector import SpecDynamicCache
+from speccache.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
 class SpeculativeDraft:
     """Candidate draft continuation tokens retrieved from a semantically similar cached entry."""
-    draft_tokens: List[int]
+
+    draft_tokens: list[int]
     similarity_score: float
     matched_chunk_idx: int = 0
-    cached_prompt_prefix: Optional[List[int]] = None
+    cached_prompt_prefix: list[int] | None = None
 
 
 @dataclass
 class VerificationResult:
     """Detailed result of target-model speculative verification."""
-    accepted_tokens: List[int]
+
+    accepted_tokens: list[int]
     bonus_token: int
     num_accepted: int
     total_emitted: int
     acceptance_rate: float
-    rejection_index: Optional[int] = None
-    target_tokens: List[int] = field(default_factory=list)
+    rejection_index: int | None = None
+    target_tokens: list[int] = field(default_factory=list)
 
     @property
-    def emitted_tokens(self) -> List[int]:
+    def emitted_tokens(self) -> list[int]:
         """All tokens emitted by this verification step (accepted tokens + bonus token)."""
         return self.accepted_tokens + [self.bonus_token]
 
@@ -72,9 +78,9 @@ class SpeculativeVerifier:
     def verify_draft_step(
         self,
         target_logits: torch.Tensor,
-        draft_tokens: Union[torch.Tensor, Sequence[int]],
-        prompt_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, int]:
+        draft_tokens: torch.Tensor | Sequence[int],
+        prompt_len: int | None = None,
+    ) -> tuple[torch.Tensor, int]:
         """Verify candidate draft tokens against target model verification logits.
 
         Compares target model predictions at positions [T-1 : T-1+gamma] against draft_tokens [0 : gamma].
@@ -131,11 +137,19 @@ class SpeculativeVerifier:
         accepted_tokens = draft_tensor[:mismatch_k]
         correction_token = int(target_preds[mismatch_k].item())
 
+        logger.debug(
+            "verify_draft_step: draft_len=%d accepted=%d mismatch_k=%d correction_token=%d",
+            num_draft,
+            len(accepted_tokens),
+            mismatch_k,
+            correction_token,
+        )
+
         return accepted_tokens, correction_token
 
     def verify_draft_tokens(
         self,
-        draft_tokens: List[int],
+        draft_tokens: list[int],
         verification_logits: torch.Tensor,
         greedy: bool = True,
     ) -> VerificationResult:
@@ -175,14 +189,14 @@ class SpeculativeVerifier:
 
     def _verify_greedy(
         self,
-        draft_tokens: List[int],
+        draft_tokens: list[int],
         logits: torch.Tensor,
     ) -> VerificationResult:
         """Greedy argmax verification matching."""
         num_draft = len(draft_tokens)
-        accepted: List[int] = []
-        target_tokens: List[int] = []
-        rejection_idx: Optional[int] = None
+        accepted: list[int] = []
+        target_tokens: list[int] = []
+        rejection_idx: int | None = None
         bonus_token: int = -1
 
         for j in range(num_draft):
@@ -212,14 +226,14 @@ class SpeculativeVerifier:
 
     def _verify_stochastic(
         self,
-        draft_tokens: List[int],
+        draft_tokens: list[int],
         logits: torch.Tensor,
     ) -> VerificationResult:
         """Stochastic verification with speculative rejection sampling."""
         num_draft = len(draft_tokens)
-        accepted: List[int] = []
-        target_tokens: List[int] = []
-        rejection_idx: Optional[int] = None
+        accepted: list[int] = []
+        target_tokens: list[int] = []
+        rejection_idx: int | None = None
         bonus_token: int = -1
 
         probs = torch.softmax(logits / max(self.temperature, 1e-4), dim=-1)
@@ -252,18 +266,19 @@ class SpeculativeVerifier:
     def rollback_cache(
         self,
         cache: SpecDynamicCache,
-        target_seq_len: Optional[int] = None,
-        valid_seq_len: Optional[int] = None,
+        target_seq_len: int | None = None,
+        valid_seq_len: int | None = None,
     ) -> None:
         """Roll back KV cache, discarding rejected speculative candidate positions."""
         seq_len = target_seq_len if target_seq_len is not None else valid_seq_len
         if seq_len is not None:
             cache.truncate(seq_len)
+            logger.debug("rollback_cache: truncated cache to valid_seq_len=%d", seq_len)
 
     def verify_and_rollback(
         self,
         cache: SpecDynamicCache,
-        draft_tokens: List[int],
+        draft_tokens: list[int],
         verification_logits: torch.Tensor,
         prompt_len: int,
         greedy: bool = True,

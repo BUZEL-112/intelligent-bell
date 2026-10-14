@@ -13,23 +13,29 @@ Implements SpecCacheLLMRunner:
   route_taken, ttft_ms, kv_reconstruct_ms, spec_accepted_tokens, spec_draft_tokens, decode_tps.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple, Union
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from speccache.cache.engine import ChunkRoutingDecision, ChunkRoutingStatus, SpecCacheEngine
+from speccache.cache.engine import ChunkRoutingStatus, SpecCacheEngine
 from speccache.kernels.reference import quantize_kv_int8
 from speccache.serving.kv_injector import MultiLayerKVInjector, SpecDynamicCache
-from speccache.serving.speculative import SpeculativeDraft, SpeculativeVerifier, VerificationResult
+from speccache.serving.speculative import SpeculativeVerifier
+from speccache.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class RoutePath(str, Enum):
     """The execution path selected by the SpecCache Three-Path Router."""
+
     EXACT_RADIX = "EXACT_RADIX"
     SEMANTIC_KV_REUSE = "SEMANTIC_KV_REUSE"
     SPECULATIVE_DRAFT = "SPECULATIVE_DRAFT"
@@ -43,6 +49,7 @@ class RoutePath(str, Enum):
 @dataclass
 class InferenceMetrics:
     """Rich performance metrics measured on every inference request."""
+
     route_taken: str  # EXACT_RADIX, SEMANTIC_KV_REUSE, SPECULATIVE_DRAFT, COLD_MISS
     ttft_ms: float
     kv_reconstruct_ms: float
@@ -57,18 +64,20 @@ class InferenceMetrics:
 @dataclass
 class GenerationChunk:
     """A streamed token chunk emitted during generation."""
+
     token: str
     token_id: int
     index: int
-    finish_reason: Optional[str] = None
-    metrics: Optional[InferenceMetrics] = None
-    telemetry: Optional[Dict[str, Any]] = None
+    finish_reason: str | None = None
+    metrics: InferenceMetrics | None = None
+    telemetry: dict[str, Any] | None = None
 
 
 @dataclass
 class GenerationResult:
     """Final output and comprehensive telemetry metrics for a generation request."""
-    generated_tokens: List[int]
+
+    generated_tokens: list[int]
     text: str
     metrics: InferenceMetrics
 
@@ -108,6 +117,7 @@ class GenerationResult:
 @dataclass
 class ModelOutput:
     """Standardized output from a model forward pass."""
+
     logits: torch.Tensor
     past_key_values: SpecDynamicCache
 
@@ -133,7 +143,7 @@ class MockL4TransformerEngine(nn.Module):
         head_dim: int = 128,
         hidden_dim: int = 2048,
         vocab_size: int = 32000,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> None:
         """Initialize transformer engine."""
         super().__init__()
@@ -150,29 +160,25 @@ class MockL4TransformerEngine(nn.Module):
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
 
         # Multi-layer projections
-        self.q_proj = nn.ModuleList([
-            nn.Linear(hidden_dim, num_q_heads * head_dim, bias=False)
-            for _ in range(num_layers)
-        ])
-        self.k_proj = nn.ModuleList([
-            nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
-            for _ in range(num_layers)
-        ])
-        self.v_proj = nn.ModuleList([
-            nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
-            for _ in range(num_layers)
-        ])
-        self.out_proj = nn.ModuleList([
-            nn.Linear(num_q_heads * head_dim, hidden_dim, bias=False)
-            for _ in range(num_layers)
-        ])
+        self.q_proj = nn.ModuleList(
+            [nn.Linear(hidden_dim, num_q_heads * head_dim, bias=False) for _ in range(num_layers)]
+        )
+        self.k_proj = nn.ModuleList(
+            [nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False) for _ in range(num_layers)]
+        )
+        self.v_proj = nn.ModuleList(
+            [nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False) for _ in range(num_layers)]
+        )
+        self.out_proj = nn.ModuleList(
+            [nn.Linear(num_q_heads * head_dim, hidden_dim, bias=False) for _ in range(num_layers)]
+        )
 
         self.to(self.device)
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        past_key_values: Optional[SpecDynamicCache] = None,
+        past_key_values: SpecDynamicCache | None = None,
         use_cache: bool = True,
     ) -> ModelOutput:
         """Execute forward pass through multi-layer Transformer using real SDPA."""
@@ -182,13 +188,25 @@ class MockL4TransformerEngine(nn.Module):
         b, t = input_ids.shape
         x = self.embed_tokens(input_ids)  # [B, T, hidden_dim]
 
-        for l in range(self.num_layers):
-            q = self.q_proj[l](x).view(b, t, self.num_q_heads, self.head_dim).transpose(1, 2)
-            k = self.k_proj[l](x).view(b, t, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v = self.v_proj[l](x).view(b, t, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        for layer_idx in range(self.num_layers):
+            q = (
+                self.q_proj[layer_idx](x)
+                .view(b, t, self.num_q_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj[layer_idx](x)
+                .view(b, t, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj[layer_idx](x)
+                .view(b, t, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
 
             if past_key_values is not None:
-                k, v = past_key_values.update(k, v, layer_idx=l)
+                k, v = past_key_values.update(k, v, layer_idx=layer_idx)
 
             # GQA head repeating
             if self.num_q_heads > self.num_kv_heads:
@@ -202,7 +220,7 @@ class MockL4TransformerEngine(nn.Module):
             is_causal = t > 1
             attn_out = F.scaled_dot_product_attention(q, k_rep, v_rep, is_causal=is_causal)
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, -1)
-            x = x + self.out_proj[l](attn_out)
+            x = x + self.out_proj[layer_idx](attn_out)
 
         logits = self.lm_head(x)  # [B, T, vocab_size]
         return ModelOutput(logits=logits, past_key_values=past_key_values)  # type: ignore
@@ -228,11 +246,11 @@ class SpecCacheLLMRunner:
     def __init__(
         self,
         engine: SpecCacheEngine,
-        model: Optional[Any] = None,
-        tokenizer: Optional[Any] = None,
+        model: Any | None = None,
+        tokenizer: Any | None = None,
         chunk_size: int = 64,
         draft_gamma: int = 6,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> None:
         """Initialize runner.
 
@@ -278,7 +296,7 @@ class SpecCacheLLMRunner:
     def load_open_model(
         cls,
         model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
         engine_chunk_size: int = 64,
     ) -> "SpecCacheLLMRunner":
         """Load an open model or fallback gracefully to MockL4TransformerEngine."""
@@ -288,6 +306,7 @@ class SpecCacheLLMRunner:
 
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
+
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -295,7 +314,9 @@ class SpecCacheLLMRunner:
                 device_map={"": dev},
             )
             h_kv = getattr(model.config, "num_key_value_heads", 8)
-            d = getattr(model.config, "hidden_size", 1024) // getattr(model.config, "num_attention_heads", 16)
+            d = getattr(model.config, "hidden_size", 1024) // getattr(
+                model.config, "num_attention_heads", 16
+            )
         except Exception:
             h_kv = 8
             d = 128
@@ -339,13 +360,13 @@ class SpecCacheLLMRunner:
 
     def generate(
         self,
-        prompt_tokens: List[int],
+        prompt_tokens: list[int],
         max_new_tokens: int = 32,
         temperature: float = 0.0,
     ) -> GenerationResult:
         """Generate tokens according to the SpecCache Three-Path Execution Router."""
         t_start = time.perf_counter()
-        t_first_token: Optional[float] = None
+        t_first_token: float | None = None
         t_reconstruct_ms: float = 0.0
 
         tokens = list(prompt_tokens)
@@ -353,8 +374,7 @@ class SpecCacheLLMRunner:
         num_chunks = len(tokens) // self.chunk_size
 
         chunks_tokens = [
-            tokens[c * self.chunk_size : (c + 1) * self.chunk_size]
-            for c in range(num_chunks)
+            tokens[c * self.chunk_size : (c + 1) * self.chunk_size] for c in range(num_chunks)
         ]
         chunks_embs = [self._embed_chunk(c) for c in chunks_tokens]
         target_positions = [c * self.chunk_size for c in range(num_chunks)]
@@ -379,13 +399,27 @@ class SpecCacheLLMRunner:
             route = RoutePath.EXACT_RADIX
         elif (exact_count + semantic_count) == num_chunks and num_chunks > 0:
             route = RoutePath.SEMANTIC_KV_REUSE
-        elif speculative_decisions and len(speculative_decisions[0].continuation_tokens) >= self.draft_gamma:
+        elif (
+            speculative_decisions
+            and len(speculative_decisions[0].continuation_tokens) >= self.draft_gamma
+        ):
             route = RoutePath.SPECULATIVE_DRAFT
         else:
             route = RoutePath.COLD_MISS
 
+        logger.info(
+            "Routing decision: route=%s prompt_tokens=%d chunks=%d (exact=%d semantic=%d spec_draft=%d) recon_time=%.2fms",
+            route.value,
+            num_prompt_tokens,
+            num_chunks,
+            exact_count,
+            semantic_count,
+            len(speculative_decisions),
+            t_reconstruct_ms,
+        )
+
         cache = SpecDynamicCache()
-        generated_tokens: List[int] = []
+        generated_tokens: list[int] = []
         spec_accepted = 0
         spec_drafted = 0
 
@@ -393,10 +427,10 @@ class SpecCacheLLMRunner:
         # PATH 1 & 2: DIRECT KV REUSE (EXACT_RADIX or SEMANTIC_KV_REUSE)
         # ======================================================================
         if route in (RoutePath.EXACT_RADIX, RoutePath.SEMANTIC_KV_REUSE):
-            for l in range(self.kv_injector.num_layers):
+            for layer_idx in range(self.kv_injector.num_layers):
                 self.kv_injector.inject_layer_kv(
                     cache=cache,
-                    layer_idx=l,
+                    layer_idx=layer_idx,
                     k_tensor=k_recon,
                     v_tensor=v_recon,
                 )
@@ -508,6 +542,15 @@ class SpecCacheLLMRunner:
             generated_tokens=len(generated_tokens),
         )
 
+        logger.info(
+            "Generation completed: route=%s tokens_generated=%d ttft=%.2fms tps=%.1f total_time=%.2fms",
+            route.value,
+            len(generated_tokens),
+            ttft_ms,
+            decode_tps,
+            total_time_ms,
+        )
+
         return GenerationResult(
             generated_tokens=generated_tokens,
             text=text,
@@ -516,7 +559,7 @@ class SpecCacheLLMRunner:
 
     async def stream_generate(
         self,
-        prompt_tokens: List[int],
+        prompt_tokens: list[int],
         max_new_tokens: int = 32,
         temperature: float = 0.0,
     ) -> AsyncIterator[GenerationChunk]:

@@ -16,32 +16,22 @@ Verifies:
 4. Input validation and fail-fast exception handling.
 """
 
-from typing import Tuple
 import pytest
 import torch
 
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
-    dequant_and_rope_key_compiled,
-    dequant_and_rope_key_ref,
-    dequant_value_compiled,
     dequant_value_ref,
-    pytorch_compiled_dequant_rope_shift,
     pytorch_eager_dequant_rope_shift,
     quantize_kv_int8,
-    quantize_symmetric_int8,
     rotate_half,
     validate_key_inputs,
-    validate_value_inputs,
 )
 
 try:
     from speccache.kernels.triton_rope_kv import (
         TRITON_AVAILABLE,
-        dequant_and_rope_key,
-        dequant_kv_cache,
         dequant_value,
-        fused_k_dequant_rope_shift_kernel,
         triton_fused_k_dequant_rope_shift,
     )
 except ImportError:
@@ -53,7 +43,7 @@ def _create_mock_quantized_key(
     h: int,
     d: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Helper to generate reproducible INT8 quantized keys and scales."""
     torch.manual_seed(42)
     raw_k = torch.randn((t, h, d), dtype=torch.float32, device=device)
@@ -66,7 +56,7 @@ def _create_mock_quantized_value(
     h: int,
     d: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Helper to generate reproducible INT8 quantized values and scales."""
     torch.manual_seed(1337)
     raw_v = torch.randn((t, h, d), dtype=torch.float32, device=device)
@@ -77,6 +67,7 @@ def _create_mock_quantized_value(
 # ==============================================================================
 # Unit & Mathematical Invariant Tests (CPU & GPU)
 # ==============================================================================
+
 
 def test_rotate_half():
     """Verify rotate_half maps [x1, x2] to [-x2, x1]."""
@@ -119,7 +110,6 @@ def test_reference_rotational_composition():
     """Verify group homomorphism: R(delta1 + delta2) == R(delta2) * R(delta1)."""
     device = torch.device("cpu")
     t, h, d = 8, 2, 64
-    d_half = d // 2
 
     k_quant, k_scale = _create_mock_quantized_key(t, h, d, device)
 
@@ -147,6 +137,7 @@ def test_reference_rotational_composition():
 # ==============================================================================
 # Triton GPU Kernel Correctness Suite (Section C)
 # ==============================================================================
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required for Triton tests")
 @pytest.mark.parametrize("t", [1, 17, 128, 511, 2048, 4096])
@@ -198,7 +189,9 @@ def test_end_to_end_rotational_equivalence():
     raw_k = torch.randn((t, h, d), dtype=torch.float16, device=device)
 
     # 2. Rotate by m = 600
-    cos_600, sin_600 = compute_rope_cos_sin_delta(torch.tensor([600], device=device), d, device=device)
+    cos_600, sin_600 = compute_rope_cos_sin_delta(
+        torch.tensor([600], device=device), d, device=device
+    )
     cos_600_full = torch.cat([cos_600, cos_600], dim=-1)[:, None, :].to(torch.float32)
     sin_600_full = torch.cat([sin_600, sin_600], dim=-1)[:, None, :].to(torch.float32)
 
@@ -217,13 +210,17 @@ def test_end_to_end_rotational_equivalence():
     )
 
     # 5. Direct rotation at target position 250 (600 - 350 = 250)
-    cos_250, sin_250 = compute_rope_cos_sin_delta(torch.tensor([250], device=device), d, device=device)
+    cos_250, sin_250 = compute_rope_cos_sin_delta(
+        torch.tensor([250], device=device), d, device=device
+    )
     cos_250_full = torch.cat([cos_250, cos_250], dim=-1)[:, None, :].to(torch.float32)
     sin_250_full = torch.cat([sin_250, sin_250], dim=-1)[:, None, :].to(torch.float32)
 
     k_rot_250 = (raw_k_f32 * cos_250_full + rotate_half(raw_k_f32) * sin_250_full).to(torch.float16)
     k_quant_250, k_scale_250 = quantize_kv_int8(k_rot_250)
-    direct_target = (k_quant_250.to(torch.float32) * k_scale_250.to(torch.float32)).to(torch.float16)
+    direct_target = (k_quant_250.to(torch.float32) * k_scale_250.to(torch.float32)).to(
+        torch.float16
+    )
 
     # Both pathways undergo one round of INT8 quantization and float16 conversion.
     # Independent rounding at two different angles can introduce up to ~1.5 LSB quantization variance (~0.04 max diff).
@@ -245,10 +242,14 @@ def test_triton_preallocated_buffer():
     t, h, d = 64, 8, 128
     k_quant, k_scale = _create_mock_quantized_key(t, h, d, device)
 
-    cos_delta, sin_delta = compute_rope_cos_sin_delta(torch.tensor([12], device=device), d, device=device)
+    cos_delta, sin_delta = compute_rope_cos_sin_delta(
+        torch.tensor([12], device=device), d, device=device
+    )
     preallocated = torch.empty((t, h, d), dtype=torch.float16, device=device)
 
-    ret = triton_fused_k_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=preallocated)
+    ret = triton_fused_k_dequant_rope_shift(
+        k_quant, k_scale, cos_delta, sin_delta, out=preallocated
+    )
     assert ret.data_ptr() == preallocated.data_ptr()
 
     ref = pytorch_eager_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta)
@@ -271,6 +272,7 @@ def test_triton_value_dequant_correctness():
 # ==============================================================================
 # Fail-Fast Input Validation Tests
 # ==============================================================================
+
 
 def test_validation_odd_head_dim():
     """Head dimension must be even for RoPE."""

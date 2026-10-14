@@ -54,8 +54,12 @@ from speccache.serving import (
     VerificationResult,
     create_app,
 )
+from speccache.utils import configure_logging, get_logger
 
 __all__ = [
+    # Utilities & Logging
+    "configure_logging",
+    "get_logger",
     # Phase 3 Serving & Inference
     "GenerationChunk",
     "GenerationResult",

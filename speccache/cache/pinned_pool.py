@@ -19,6 +19,10 @@ from dataclasses import dataclass, field
 
 import torch
 
+from speccache.utils import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class OriginalPositionMetadata:
@@ -105,8 +109,26 @@ class PinnedKVPool:
                 self.v_scale = self.v_scale.pin_memory()
                 self.original_start_pos = self.original_start_pos.pin_memory()
                 self._is_pinned = True
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to pin host memory: %s", e)
                 self._is_pinned = False
+
+        if self._is_pinned:
+            logger.info(
+                "PinnedKVPool initialized: max_blocks=%d chunk_size=%d heads=%d head_dim=%d (pinned DMA active)",
+                max_blocks,
+                chunk_size,
+                num_heads,
+                head_dim,
+            )
+        else:
+            logger.info(
+                "PinnedKVPool initialized: max_blocks=%d chunk_size=%d heads=%d head_dim=%d (unpinned host memory)",
+                max_blocks,
+                chunk_size,
+                num_heads,
+                head_dim,
+            )
 
         # Slab allocator: free slot stack
         self._free_block_ids: list[int] = list(range(max_blocks))
@@ -164,6 +186,7 @@ class PinnedKVPool:
         else:
             # Evict least recently used block (first entry in OrderedDict)
             block_id, old_meta = self._active_lru.popitem(last=False)
+            logger.debug("LRU evicted block_id=%d (start_pos=%d)", block_id, old_meta.start_pos)
             if self.on_evict_callback is not None:
                 self.on_evict_callback(block_id)
 
@@ -217,6 +240,7 @@ class PinnedKVPool:
             v_scale: Alias for v_s.
         """
         if block_id not in self._active_lru:
+            logger.error("write_block called on unallocated block_id=%d", block_id)
             raise KeyError(f"Block ID {block_id} is not an allocated active block.")
 
         k_target = k_q if k_q is not None else k_quant
@@ -225,18 +249,43 @@ class PinnedKVPool:
         vs_target = v_s if v_s is not None else v_scale
 
         if k_target is None or ks_target is None or v_target is None or vs_target is None:
+            logger.error("write_block missing tensor components for block_id=%d", block_id)
             raise ValueError("Quantized key/value and scale factor tensors must be provided.")
 
         expected_kv_shape = (self.chunk_size, self.num_heads, self.head_dim)
         expected_s_shape = (self.chunk_size, self.num_heads, 1)
 
         if k_target.shape != expected_kv_shape or k_target.dtype != torch.int8:
+            logger.error(
+                "write_block k_quant mismatch: shape=%s expected=%s dtype=%s expected=int8",
+                k_target.shape,
+                expected_kv_shape,
+                k_target.dtype,
+            )
             raise ValueError(f"k_q shape {k_target.shape} dtype {k_target.dtype} invalid.")
         if ks_target.shape != expected_s_shape or ks_target.dtype != torch.float16:
+            logger.error(
+                "write_block k_scale mismatch: shape=%s expected=%s dtype=%s expected=float16",
+                ks_target.shape,
+                expected_s_shape,
+                ks_target.dtype,
+            )
             raise ValueError(f"k_s shape {ks_target.shape} dtype {ks_target.dtype} invalid.")
         if v_target.shape != expected_kv_shape or v_target.dtype != torch.int8:
+            logger.error(
+                "write_block v_quant mismatch: shape=%s expected=%s dtype=%s expected=int8",
+                v_target.shape,
+                expected_kv_shape,
+                v_target.dtype,
+            )
             raise ValueError(f"v_q shape {v_target.shape} dtype {v_target.dtype} invalid.")
         if vs_target.shape != expected_s_shape or vs_target.dtype != torch.float16:
+            logger.error(
+                "write_block v_scale mismatch: shape=%s expected=%s dtype=%s expected=float16",
+                vs_target.shape,
+                expected_s_shape,
+                vs_target.dtype,
+            )
             raise ValueError(f"v_s shape {vs_target.shape} dtype {vs_target.dtype} invalid.")
 
         self.k_quant[block_id].copy_(k_target, non_blocking=False)

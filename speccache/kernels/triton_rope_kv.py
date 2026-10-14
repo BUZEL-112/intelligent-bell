@@ -21,21 +21,21 @@ Hardware-Aware Systems Design Principles:
   storing to k_out.
 """
 
-from typing import Optional, Tuple
 import torch
 
 try:
     import triton
     import triton.language as tl
+
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
 
 from speccache.kernels.reference import (
+    compute_rope_cos_sin_delta,
     validate_key_inputs,
     validate_value_inputs,
 )
-
 
 if TRITON_AVAILABLE:
 
@@ -143,9 +143,7 @@ if TRITON_AVAILABLE:
         # Load scales: k_scale shape [T, H, 1]
         scale_mask = mask_t[:, None, None] & mask_h[None, :, None]
         scale_ptrs = (
-            k_scale_ptr
-            + offs_t[:, None, None] * stride_st
-            + offs_h[None, :, None] * stride_sh
+            k_scale_ptr + offs_t[:, None, None] * stride_st + offs_h[None, :, None] * stride_sh
         )
         scale = tl.load(scale_ptrs, mask=scale_mask, other=0.0).to(tl.float32)
 
@@ -170,7 +168,6 @@ if TRITON_AVAILABLE:
 
         tl.store(out1_ptrs, out1.to(tl.float16), mask=mask_3d)
         tl.store(out2_ptrs, out2.to(tl.float16), mask=mask_3d)
-
 
     @triton.autotune(
         configs=[
@@ -225,9 +222,7 @@ if TRITON_AVAILABLE:
 
         scale_mask = (offs_t[:, None, None] < num_tokens) & (offs_h[None, :, None] < num_heads)
         scale_ptrs = (
-            v_scale_ptr
-            + offs_t[:, None, None] * stride_st
-            + offs_h[None, :, None] * stride_sh
+            v_scale_ptr + offs_t[:, None, None] * stride_st + offs_h[None, :, None] * stride_sh
         )
         scale = tl.load(scale_ptrs, mask=scale_mask, other=0.0).to(tl.float32)
 
@@ -245,9 +240,11 @@ if TRITON_AVAILABLE:
 def triton_fused_k_dequant_rope_shift(
     k_quant: torch.Tensor,
     k_scale: torch.Tensor,
-    cos_delta: torch.Tensor,
-    sin_delta: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    cos_delta: torch.Tensor | None = None,
+    sin_delta: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    *,
+    delta_p: int | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Execute production 2D-tiled Triton kernel fusing INT8 dequant with relative RoPE.
 
@@ -256,15 +253,31 @@ def triton_fused_k_dequant_rope_shift(
     Args:
         k_quant: INT8 quantized keys of shape [num_tokens, num_kv_heads, head_dim].
         k_scale: FP16 scale of shape [num_tokens, num_kv_heads, 1].
-        cos_delta: FP16 cosine factors of shape [1, head_dim // 2] or [num_tokens, head_dim // 2].
-        sin_delta: FP16 sine factors of shape [1, head_dim // 2] or [num_tokens, head_dim // 2].
+        cos_delta: FP16 cosine factors of shape [1, head_dim // 2] or [num_tokens, head_dim // 2]. Optional if delta_p is provided.
+        sin_delta: FP16 sine factors of shape [1, head_dim // 2] or [num_tokens, head_dim // 2]. Optional if delta_p is provided.
         out: Optional pre-allocated FP16 buffer of shape [num_tokens, num_kv_heads, head_dim].
+        delta_p: Optional token displacement integer or tensor to compute cos/sin automatically.
 
     Returns:
         k_out: FP16 tensor of shape [num_tokens, num_kv_heads, head_dim].
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("OpenAI Triton is not installed or available in this environment.")
+
+    if cos_delta is None or sin_delta is None:
+        if delta_p is None:
+            raise ValueError(
+                "Either (cos_delta, sin_delta) tensors or delta_p displacement must be provided."
+            )
+        if not isinstance(delta_p, torch.Tensor):
+            dp_tensor = torch.tensor([delta_p], device=k_quant.device)
+        else:
+            dp_tensor = delta_p.to(device=k_quant.device)
+        cos_delta, sin_delta = compute_rope_cos_sin_delta(
+            dp_tensor,
+            head_dim=k_quant.shape[-1],
+            device=k_quant.device,
+        )
 
     validate_key_inputs(k_quant, k_scale, cos_delta, sin_delta, out)
 
@@ -295,11 +308,11 @@ def triton_fused_k_dequant_rope_shift(
 
     block_d = triton.next_power_of_2(d_half)
 
-    # 2D Grid launch: (cdiv(T, BLOCK_T), cdiv(H, BLOCK_H))
-    grid = lambda META: (
-        triton.cdiv(t, META["BLOCK_T"]),
-        triton.cdiv(h, META["BLOCK_H"]),
-    )
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return (
+            triton.cdiv(t, meta["BLOCK_T"]),
+            triton.cdiv(h, meta["BLOCK_H"]),
+        )
 
     fused_k_dequant_rope_shift_kernel[grid](
         k_quant_c,
@@ -336,7 +349,7 @@ dequant_and_rope_key = triton_fused_k_dequant_rope_shift
 def dequant_value(
     v_quant: torch.Tensor,
     v_scale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Execute production Triton kernel for INT8 Value cache dequantization.
 
@@ -367,10 +380,12 @@ def dequant_value(
     v_scale_c = v_scale.contiguous()
 
     block_d = triton.next_power_of_2(d)
-    grid = lambda META: (
-        triton.cdiv(t, META["BLOCK_T"]),
-        triton.cdiv(h, META["BLOCK_H"]),
-    )
+
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return (
+            triton.cdiv(t, meta["BLOCK_T"]),
+            triton.cdiv(h, meta["BLOCK_H"]),
+        )
 
     _dequant_value_kernel_2d[grid](
         v_quant_c,
@@ -400,9 +415,9 @@ def dequant_kv_cache(
     v_scale: torch.Tensor,
     cos_delta: torch.Tensor,
     sin_delta: torch.Tensor,
-    k_out: Optional[torch.Tensor] = None,
-    v_out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    k_out: torch.Tensor | None = None,
+    v_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Unified entrypoint to dequantize both Key and Value caches in one call."""
     k_res = triton_fused_k_dequant_rope_shift(k_quant, k_scale, cos_delta, sin_delta, out=k_out)
     v_res = dequant_value(v_quant, v_scale, out=v_out)

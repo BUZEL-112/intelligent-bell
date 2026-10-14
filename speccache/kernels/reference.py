@@ -7,7 +7,6 @@ variants for:
 3. Helper utilities for RoPE frequency tables and symmetric quantization
 """
 
-from typing import Optional, Tuple
 import torch
 
 
@@ -16,7 +15,7 @@ def validate_key_inputs(
     k_scale: torch.Tensor,
     cos_delta: torch.Tensor,
     sin_delta: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> None:
     """Validate tensor shapes, dtypes, and device compatibility for key operations.
 
@@ -37,9 +36,7 @@ def validate_key_inputs(
         raise TypeError(f"k_quant must be torch.int8, got {k_quant.dtype}")
 
     if k_scale.ndim != 3 or k_scale.shape != (t, h, 1):
-        raise ValueError(
-            f"k_scale must have shape [{t}, {h}, 1], got {k_scale.shape}"
-        )
+        raise ValueError(f"k_scale must have shape [{t}, {h}, 1], got {k_scale.shape}")
 
     if k_scale.dtype != torch.float16:
         raise TypeError(f"k_scale must be torch.float16, got {k_scale.dtype}")
@@ -49,8 +46,7 @@ def validate_key_inputs(
 
     if cos_delta.shape not in valid_shift_shapes:
         raise ValueError(
-            f"cos_delta must have shape [1, {d_half}] or [{t}, {d_half}], "
-            f"got {cos_delta.shape}"
+            f"cos_delta must have shape [1, {d_half}] or [{t}, {d_half}], got {cos_delta.shape}"
         )
 
     if sin_delta.shape != cos_delta.shape:
@@ -65,11 +61,7 @@ def validate_key_inputs(
         )
 
     device = k_quant.device
-    if (
-        k_scale.device != device
-        or cos_delta.device != device
-        or sin_delta.device != device
-    ):
+    if k_scale.device != device or cos_delta.device != device or sin_delta.device != device:
         raise ValueError(
             f"All tensors must reside on the same device ({device}), but got devices: "
             f"k_scale={k_scale.device}, cos_delta={cos_delta.device}, sin_delta={sin_delta.device}"
@@ -83,13 +75,15 @@ def validate_key_inputs(
         if out.dtype != torch.float16:
             raise TypeError(f"out tensor must be torch.float16, got {out.dtype}")
         if out.device != device:
-            raise ValueError(f"out tensor device ({out.device}) does not match input device ({device})")
+            raise ValueError(
+                f"out tensor device ({out.device}) does not match input device ({device})"
+            )
 
 
 def validate_value_inputs(
     v_quant: torch.Tensor,
     v_scale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> None:
     """Validate tensor shapes, dtypes, and devices for value dequantization."""
     if v_quant.ndim != 3:
@@ -104,9 +98,7 @@ def validate_value_inputs(
         raise TypeError(f"v_quant must be torch.int8, got {v_quant.dtype}")
 
     if v_scale.ndim != 3 or v_scale.shape != (t, h, 1):
-        raise ValueError(
-            f"v_scale must have shape [{t}, {h}, 1], got {v_scale.shape}"
-        )
+        raise ValueError(f"v_scale must have shape [{t}, {h}, 1], got {v_scale.shape}")
 
     if v_scale.dtype != torch.float16:
         raise TypeError(f"v_scale must be torch.float16, got {v_scale.dtype}")
@@ -118,22 +110,22 @@ def validate_value_inputs(
 
     if out is not None:
         if out.shape != (t, h, d):
-            raise ValueError(
-                f"out tensor must have shape [{t}, {h}, {d}], got {out.shape}"
-            )
+            raise ValueError(f"out tensor must have shape [{t}, {h}, {d}], got {out.shape}")
         if out.dtype != torch.float16:
             raise TypeError(f"out tensor must be torch.float16, got {out.dtype}")
         if out.device != v_quant.device:
-            raise ValueError(f"out tensor device ({out.device}) does not match input device ({v_quant.device})")
+            raise ValueError(
+                f"out tensor device ({out.device}) does not match input device ({v_quant.device})"
+            )
 
 
 def compute_rope_cos_sin_delta(
     delta_positions: torch.Tensor,
     head_dim: int,
     theta_base: float = 10000.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     dtype: torch.dtype = torch.float16,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute relative RoPE cos and sin tables for given position displacements.
 
     According to the RoPE formulation, the rotary frequency for pair index i is:
@@ -187,7 +179,7 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def quantize_kv_int8(
     x: torch.Tensor,
     eps: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize floating-point KV tensor to INT8 with dynamic per-token-head absmax scale.
 
     Computes dynamic per-token, per-head absmax scale:
@@ -220,9 +212,11 @@ quantize_symmetric_int8 = quantize_kv_int8
 def pytorch_eager_dequant_rope_shift(
     k_quant: torch.Tensor,
     k_scale: torch.Tensor,
-    cos_delta: torch.Tensor,
-    sin_delta: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    cos_delta: torch.Tensor | None = None,
+    sin_delta: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    *,
+    delta_p: int | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Eager PyTorch baseline for fused INT8 dequantization and relative RoPE phase-shifting.
 
@@ -234,13 +228,29 @@ def pytorch_eager_dequant_rope_shift(
     Args:
         k_quant: INT8 quantized keys [T, H, D].
         k_scale: FP16 scales [T, H, 1].
-        cos_delta: FP16 cosine factors [1, D // 2] or [T, D // 2].
-        sin_delta: FP16 sine factors [1, D // 2] or [T, D // 2].
+        cos_delta: FP16 cosine factors [1, D // 2] or [T, D // 2]. Optional if delta_p is provided.
+        sin_delta: FP16 sine factors [1, D // 2] or [T, D // 2]. Optional if delta_p is provided.
         out: Optional pre-allocated output buffer [T, H, D] in FP16.
+        delta_p: Optional token displacement integer or tensor to compute cos/sin automatically.
 
     Returns:
         k_out: Rotated and dequantized FP16 tensor [T, H, D].
     """
+    if cos_delta is None or sin_delta is None:
+        if delta_p is None:
+            raise ValueError(
+                "Either (cos_delta, sin_delta) tensors or delta_p displacement must be provided."
+            )
+        if not isinstance(delta_p, torch.Tensor):
+            dp_tensor = torch.tensor([delta_p], device=k_quant.device)
+        else:
+            dp_tensor = delta_p.to(device=k_quant.device)
+        cos_delta, sin_delta = compute_rope_cos_sin_delta(
+            dp_tensor,
+            head_dim=k_quant.shape[-1],
+            device=k_quant.device,
+        )
+
     validate_key_inputs(k_quant, k_scale, cos_delta, sin_delta, out)
 
     # Dequantize with FP32 precision
@@ -273,7 +283,7 @@ dequant_and_rope_key_ref = pytorch_eager_dequant_rope_shift
 def dequant_value_ref(
     v_quant: torch.Tensor,
     v_scale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Eager PyTorch reference for Value cache INT8 dequantization.
 

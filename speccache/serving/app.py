@@ -10,21 +10,32 @@ Exposes:
 - GET /health & GET /metrics: System health and Prometheus telemetry.
 """
 
-from dataclasses import asdict
 import json
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
-from fastapi import FastAPI, HTTPException, Request, Response
+from collections.abc import AsyncIterator
+from dataclasses import asdict
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from speccache.cache.engine import SpecCacheEngine
-from speccache.serving.pipeline import GenerationResult, InferenceMetrics, RoutePath, SpecCacheLLMRunner
+from speccache.serving.pipeline import (
+    GenerationResult,
+    InferenceMetrics,
+    RoutePath,
+    SpecCacheLLMRunner,
+)
+from speccache.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class GenerateRequest(BaseModel):
     """Payload for generation endpoints."""
-    prompt: Optional[str] = None
-    tokens: Optional[List[int]] = None
+
+    prompt: str | None = None
+    tokens: list[int] | None = None
     max_tokens: int = Field(default=32, ge=1, le=2048)
     temperature: float = Field(default=0.0, ge=0.0)
     stream: bool = False
@@ -32,26 +43,28 @@ class GenerateRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     """Individual chat message."""
+
     role: str
     content: str
 
 
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion payload."""
-    messages: Optional[List[ChatMessage]] = None
-    prompt: Optional[str] = None
-    tokens: Optional[List[int]] = None
+
+    messages: list[ChatMessage] | None = None
+    prompt: str | None = None
+    tokens: list[int] | None = None
     max_tokens: int = Field(default=32, ge=1, le=2048)
     temperature: float = Field(default=0.0, ge=0.0)
     stream: bool = False
 
 
-def _format_sse_event(data: Dict[str, Any]) -> str:
+def _format_sse_event(data: dict[str, Any]) -> str:
     """Format dictionary into standard Server-Sent Event data block."""
     return f"data: {json.dumps(data)}\n\n"
 
 
-def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
+def create_app(runner: SpecCacheLLMRunner | None = None) -> FastAPI:
     """Create and configure FastAPI application for SpecCache inference serving.
 
     Args:
@@ -87,7 +100,7 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
         "cold_miss_ttft_sum": 0.0,
     }
 
-    def _resolve_tokens(req: Union[GenerateRequest, ChatCompletionRequest]) -> List[int]:
+    def _resolve_tokens(req: GenerateRequest | ChatCompletionRequest) -> list[int]:
         if req.tokens is not None and len(req.tokens) > 0:
             return req.tokens
         text = req.prompt or ""
@@ -113,7 +126,7 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
             stats["cold_miss_total"] += 1
             stats["cold_miss_ttft_sum"] += metrics.ttft_ms
 
-    def _build_headers(metrics: InferenceMetrics) -> Dict[str, str]:
+    def _build_headers(metrics: InferenceMetrics) -> dict[str, str]:
         ratio = (
             metrics.spec_accepted_tokens / metrics.spec_draft_tokens
             if metrics.spec_draft_tokens > 0
@@ -129,8 +142,12 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
             "x-speccache-tokens-per-sec": f"{metrics.decode_tps:.2f}",
             "x-speccache-spec-accepted-tokens": str(metrics.spec_accepted_tokens),
             "x-speccache-dma-bytes-saved": "1024",
-            "x-speccache-kv-blocks-reused": "1" if metrics.route_taken in ("EXACT_RADIX", "SEMANTIC_KV_REUSE") else "0",
-            "x-speccache-similarity": "1.00" if metrics.route_taken in ("EXACT_RADIX", "SEMANTIC_KV_REUSE") else "0.00",
+            "x-speccache-kv-blocks-reused": "1"
+            if metrics.route_taken in ("EXACT_RADIX", "SEMANTIC_KV_REUSE")
+            else "0",
+            "x-speccache-similarity": "1.00"
+            if metrics.route_taken in ("EXACT_RADIX", "SEMANTIC_KV_REUSE")
+            else "0.00",
         }
 
     # ==========================================================================
@@ -148,11 +165,22 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
             # Delegate to stream generator
             return await generate_stream_endpoint(req)
 
-        result: GenerationResult = runner_instance.generate(
-            prompt_tokens=tokens,
-            max_new_tokens=req.max_tokens,
-            temperature=req.temperature,
+        logger.info(
+            "POST /v1/generate: tokens=%d max_tokens=%d temp=%.2f",
+            len(tokens),
+            req.max_tokens,
+            req.temperature,
         )
+        try:
+            result: GenerationResult = runner_instance.generate(
+                prompt_tokens=tokens,
+                max_new_tokens=req.max_tokens,
+                temperature=req.temperature,
+            )
+        except Exception as exc:
+            logger.error("POST /v1/generate failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
         _update_stats(result.metrics)
         headers = _build_headers(result.metrics)
 
@@ -172,27 +200,46 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
         runner_instance: SpecCacheLLMRunner = app.state.runner
         tokens = _resolve_tokens(req)
 
-        # Pre-generate to attach hardware headers immediately
-        result = runner_instance.generate(
-            prompt_tokens=tokens,
-            max_new_tokens=req.max_tokens,
-            temperature=req.temperature,
+        logger.info(
+            "POST /v1/generate/stream: tokens=%d max_tokens=%d temp=%.2f",
+            len(tokens),
+            req.max_tokens,
+            req.temperature,
         )
+        try:
+            # Pre-generate to attach hardware headers immediately
+            result = runner_instance.generate(
+                prompt_tokens=tokens,
+                max_new_tokens=req.max_tokens,
+                temperature=req.temperature,
+            )
+        except Exception as exc:
+            logger.error("POST /v1/generate/stream failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
         _update_stats(result.metrics)
         headers = _build_headers(result.metrics)
 
         async def sse_event_stream() -> AsyncIterator[str]:
             for idx, tok in enumerate(result.generated_tokens):
-                tok_str = runner_instance.tokenizer.decode([tok]) if runner_instance.tokenizer else str(tok)
-                yield _format_sse_event({
-                    "token": tok_str,
-                    "token_id": tok,
-                    "index": idx,
-                })
-            yield _format_sse_event({
-                "finish_reason": "stop",
-                "metrics": asdict(result.metrics),
-            })
+                tok_str = (
+                    runner_instance.tokenizer.decode([tok])
+                    if runner_instance.tokenizer
+                    else str(tok)
+                )
+                yield _format_sse_event(
+                    {
+                        "token": tok_str,
+                        "token_id": tok,
+                        "index": idx,
+                    }
+                )
+            yield _format_sse_event(
+                {
+                    "finish_reason": "stop",
+                    "metrics": asdict(result.metrics),
+                }
+            )
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -202,7 +249,7 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
         )
 
     @app.get("/v1/stats")
-    async def get_stats() -> Dict[str, Any]:
+    async def get_stats() -> dict[str, Any]:
         """Live cache hit rates, pinned pool utilization %, and mean TTFT savings."""
         runner_instance: SpecCacheLLMRunner = app.state.runner
         stats = app.state.stats
@@ -235,7 +282,7 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
         }
 
     @app.get("/health")
-    async def health_check() -> Dict[str, Any]:
+    async def health_check() -> dict[str, Any]:
         """Check system and memory pool health."""
         runner_instance: SpecCacheLLMRunner = app.state.runner
         pool = runner_instance.engine.pool
@@ -272,20 +319,35 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest) -> Response:
         """OpenAI-compatible chat completion endpoint."""
-        gen_req = GenerateRequest(
-            prompt=req.prompt,
-            tokens=req.tokens,
-            max_tokens=req.max_tokens,
-            temperature=req.temperature,
-            stream=req.stream,
-        )
         runner_instance: SpecCacheLLMRunner = app.state.runner
         tokens = _resolve_tokens(req)
-        result: GenerationResult = runner_instance.generate(
-            prompt_tokens=tokens,
-            max_new_tokens=req.max_tokens,
-            temperature=req.temperature,
+
+        if req.stream:
+            gen_req = GenerateRequest(
+                prompt=req.prompt,
+                tokens=tokens,
+                max_tokens=req.max_tokens,
+                temperature=req.temperature,
+                stream=True,
+            )
+            return await generate_stream_endpoint(gen_req)
+
+        logger.info(
+            "POST /v1/chat/completions: tokens=%d max_tokens=%d temp=%.2f",
+            len(tokens),
+            req.max_tokens,
+            req.temperature,
         )
+        try:
+            result: GenerationResult = runner_instance.generate(
+                prompt_tokens=tokens,
+                max_new_tokens=req.max_tokens,
+                temperature=req.temperature,
+            )
+        except Exception as exc:
+            logger.error("POST /v1/chat/completions failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
         _update_stats(result.metrics)
         headers = _build_headers(result.metrics)
 
@@ -293,11 +355,13 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
             content={
                 "id": "chatcmpl-speccache",
                 "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": result.text},
-                    "finish_reason": "stop",
-                }],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": result.text},
+                        "finish_reason": "stop",
+                    }
+                ],
                 "usage": {
                     "prompt_tokens": len(tokens),
                     "completion_tokens": len(result.generated_tokens),

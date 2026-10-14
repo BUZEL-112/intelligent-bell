@@ -12,21 +12,17 @@ Verifies:
 3. Unit tests for PinnedKVPool, ChunkRadixTree, and SemanticHNSWIndex.
 """
 
-from typing import List, Tuple
 import numpy as np
-import pytest
 import torch
 
 from speccache.cache.engine import (
-    ChunkRoutingDecision,
     ChunkRoutingStatus,
     SpecCacheEngine,
 )
-from speccache.cache.pinned_pool import OriginalPositionMetadata, PinnedKVPool
+from speccache.cache.pinned_pool import PinnedKVPool
 from speccache.cache.radix_index import ChunkRadixTree
 from speccache.cache.semantic_index import (
     RouteDecision,
-    SemanticHNSWIndex,
 )
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
@@ -43,7 +39,7 @@ def _generate_synthetic_chunk(
     head_dim: int,
     seed: int = 42,
     device: str = "cpu",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate reproducible quantized Key and Value tensors for a chunk."""
     torch.manual_seed(seed)
     raw_k = torch.randn((chunk_size, num_heads, head_dim), dtype=torch.float32, device=device)
@@ -56,6 +52,7 @@ def _generate_synthetic_chunk(
 # ==============================================================================
 # Requirement E.1: Exact Hit vs. Semantic Shifted Hit Test
 # ==============================================================================
+
 
 def test_exact_hit_vs_semantic_shifted_hit():
     """Verify exact hit and semantic shifted hit with relative RoPE phase shift of -384."""
@@ -154,6 +151,7 @@ def test_exact_hit_vs_semantic_shifted_hit():
 # Requirement E.2: LRU Eviction Integrity Test
 # ==============================================================================
 
+
 def test_lru_eviction_integrity():
     """Fill pool of max_blocks = 8, insert 10 blocks, verify oldest 2 evicted and invalidated."""
     max_blocks = 8
@@ -171,8 +169,8 @@ def test_lru_eviction_integrity():
         force_fallback_semantic=True,
     )
 
-    registered_tokens: List[List[int]] = []
-    registered_embs: List[np.ndarray] = []
+    registered_tokens: list[list[int]] = []
+    registered_embs: list[np.ndarray] = []
 
     # Insert 10 blocks into pool with capacity 8
     for i in range(10):
@@ -220,6 +218,7 @@ def test_lru_eviction_integrity():
 # PinnedKVPool Unit Tests
 # ==============================================================================
 
+
 def test_pinned_kv_pool_basic_operations():
     """Verify allocate, write_block, get_block_views, touch, and free in PinnedKVPool."""
     max_blocks = 4
@@ -227,7 +226,9 @@ def test_pinned_kv_pool_basic_operations():
     heads = 4
     head_dim = 64
 
-    pool = PinnedKVPool(max_blocks=max_blocks, chunk_size=chunk_size, num_heads=heads, head_dim=head_dim)
+    pool = PinnedKVPool(
+        max_blocks=max_blocks, chunk_size=chunk_size, num_heads=heads, head_dim=head_dim
+    )
     assert pool.free_count == max_blocks
     assert pool.allocated_count == 0
 
@@ -260,6 +261,7 @@ def test_pinned_kv_pool_basic_operations():
 # ChunkRadixTree Unit Tests
 # ==============================================================================
 
+
 def test_chunk_radix_tree_prefix_matching():
     """Verify ChunkRadixTree match_prefix returns list of (chunk_idx, block_id)."""
     chunk_size = 32
@@ -290,6 +292,7 @@ def test_chunk_radix_tree_prefix_matching():
 # ==============================================================================
 # Async DMA Pipeline Multi-Chunk Parity Test
 # ==============================================================================
+
 
 def test_async_dma_pipeline_multi_chunk_parity():
     """Verify pipelined double-buffered async DMA matches reference across multi-chunk prompt."""
@@ -346,9 +349,7 @@ def test_async_dma_pipeline_multi_chunk_parity():
         cos_d, sin_d = compute_rope_cos_sin_delta(
             torch.tensor([delta_p], device=device), head_dim, device=device
         )
-        k_ref = pytorch_eager_dequant_rope_shift(
-            kq.to(device), ks.to(device), cos_d, sin_d
-        )
+        k_ref = pytorch_eager_dequant_rope_shift(kq.to(device), ks.to(device), cos_d, sin_d)
         v_ref = dequant_value_ref(vq.to(device), vs.to(device))
 
         k_slice = k_out[i * chunk_size : (i + 1) * chunk_size]
@@ -356,4 +357,3 @@ def test_async_dma_pipeline_multi_chunk_parity():
 
         torch.testing.assert_close(k_slice, k_ref, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(v_slice, v_ref, atol=1e-2, rtol=1e-2)
-
