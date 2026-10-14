@@ -15,7 +15,7 @@ authors = [
 keywords = ["gpu", "triton", "llm", "kv-cache", "rope", "quantization"]
 dependencies = [
     "torch>=2.1.0",
-    "triton>=2.1.0",
+    "triton>=2.1.0; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]

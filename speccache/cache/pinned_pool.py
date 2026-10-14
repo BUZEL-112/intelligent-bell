@@ -53,6 +53,10 @@ class PinnedKVPool:
         num_heads: int,
         head_dim: int,
         on_evict_callback: Callable[[int], None] | None = None,
+        k_quant_slab: torch.Tensor | None = None,
+        k_scale_slab: torch.Tensor | None = None,
+        v_quant_slab: torch.Tensor | None = None,
+        v_scale_slab: torch.Tensor | None = None,
     ) -> None:
         """Initialize page-locked host memory pool.
 
@@ -62,6 +66,10 @@ class PinnedKVPool:
             num_heads: Number of KV heads (e.g., 8 for GQA, 32 for MHA).
             head_dim: Head dimension D (e.g., 64, 128).
             on_evict_callback: Optional callback invoked when a block_id is evicted.
+            k_quant_slab: Optional pre-allocated slab view for quantized keys.
+            k_scale_slab: Optional pre-allocated slab view for key scales.
+            v_quant_slab: Optional pre-allocated slab view for quantized values.
+            v_scale_slab: Optional pre-allocated slab view for value scales.
         """
         if max_blocks <= 0:
             raise ValueError(f"max_blocks must be positive, got {max_blocks}")
@@ -75,43 +83,101 @@ class PinnedKVPool:
         self.on_evict_callback = on_evict_callback
 
         # Contiguous CPU memory slabs
-        self.k_quant = torch.empty(
-            (max_blocks, chunk_size, num_heads, head_dim),
-            dtype=torch.int8,
-            device="cpu",
-        )
-        self.k_scale = torch.empty(
-            (max_blocks, chunk_size, num_heads, 1),
-            dtype=torch.float16,
-            device="cpu",
-        )
-        self.v_quant = torch.empty(
-            (max_blocks, chunk_size, num_heads, head_dim),
-            dtype=torch.int8,
-            device="cpu",
-        )
-        self.v_scale = torch.empty(
-            (max_blocks, chunk_size, num_heads, 1),
-            dtype=torch.float16,
-            device="cpu",
-        )
+        if k_quant_slab is not None:
+            self.k_quant = k_quant_slab
+            self.k_scale = (
+                k_scale_slab
+                if k_scale_slab is not None
+                else torch.empty(
+                    (max_blocks, chunk_size, num_heads, 1), dtype=torch.float16, device="cpu"
+                )
+            )
+            self.v_quant = (
+                v_quant_slab
+                if v_quant_slab is not None
+                else torch.empty(
+                    (max_blocks, chunk_size, num_heads, head_dim), dtype=torch.int8, device="cpu"
+                )
+            )
+            self.v_scale = (
+                v_scale_slab
+                if v_scale_slab is not None
+                else torch.empty(
+                    (max_blocks, chunk_size, num_heads, 1), dtype=torch.float16, device="cpu"
+                )
+            )
+            self._is_pinned = getattr(self.k_quant, "is_pinned", lambda: False)()
+        else:
+            self.k_quant = torch.empty(
+                (max_blocks, chunk_size, num_heads, head_dim),
+                dtype=torch.int8,
+                device="cpu",
+            )
+            self.k_scale = torch.empty(
+                (max_blocks, chunk_size, num_heads, 1),
+                dtype=torch.float16,
+                device="cpu",
+            )
+            self.v_quant = torch.empty(
+                (max_blocks, chunk_size, num_heads, head_dim),
+                dtype=torch.int8,
+                device="cpu",
+            )
+            self.v_scale = torch.empty(
+                (max_blocks, chunk_size, num_heads, 1),
+                dtype=torch.float16,
+                device="cpu",
+            )
+            self._is_pinned = False
+            if torch.cuda.is_available():
+                try:
+                    self.k_quant = self.k_quant.pin_memory()
+                    self.k_scale = self.k_scale.pin_memory()
+                    self.v_quant = self.v_quant.pin_memory()
+                    self.v_scale = self.v_scale.pin_memory()
+                    self._is_pinned = True
+                except Exception as e:
+                    logger.warning("Failed to pin host memory: %s", e)
+                    self._is_pinned = False
 
         # Track original token start position (p_cached) for relative RoPE phase shift
         self.original_start_pos = torch.full((max_blocks,), -1, dtype=torch.long, device="cpu")
-
-        # Page-lock host memory if CUDA runtime is available
-        self._is_pinned = False
-        if torch.cuda.is_available():
+        if self._is_pinned:
             try:
-                self.k_quant = self.k_quant.pin_memory()
-                self.k_scale = self.k_scale.pin_memory()
-                self.v_quant = self.v_quant.pin_memory()
-                self.v_scale = self.v_scale.pin_memory()
                 self.original_start_pos = self.original_start_pos.pin_memory()
-                self._is_pinned = True
+            except Exception:
+                pass
+
+        # Page-locked staging buffers for coalescing non-contiguous block DMA transfers
+        self._staging_capacity = max(max_blocks, 64)
+        self._stage_kq = torch.empty(
+            (self._staging_capacity * chunk_size, num_heads, head_dim),
+            dtype=torch.int8,
+            device="cpu",
+        )
+        self._stage_ks = torch.empty(
+            (self._staging_capacity * chunk_size, num_heads, 1),
+            dtype=torch.float16,
+            device="cpu",
+        )
+        self._stage_vq = torch.empty(
+            (self._staging_capacity * chunk_size, num_heads, head_dim),
+            dtype=torch.int8,
+            device="cpu",
+        )
+        self._stage_vs = torch.empty(
+            (self._staging_capacity * chunk_size, num_heads, 1),
+            dtype=torch.float16,
+            device="cpu",
+        )
+        if self._is_pinned:
+            try:
+                self._stage_kq = self._stage_kq.pin_memory()
+                self._stage_ks = self._stage_ks.pin_memory()
+                self._stage_vq = self._stage_vq.pin_memory()
+                self._stage_vs = self._stage_vs.pin_memory()
             except Exception as e:
-                logger.warning("Failed to pin host memory: %s", e)
-                self._is_pinned = False
+                logger.warning("Failed to pin staging host memory: %s", e)
 
         if self._is_pinned:
             logger.info(
@@ -322,6 +388,118 @@ class PinnedKVPool:
             self.v_quant[block_id],
             self.v_scale[block_id],
         )
+
+    def get_coalesced_views(
+        self,
+        block_ids: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return coalesced pinned host memory tensor views for a sequence of blocks.
+
+        For contiguous block sequences (e.g., range(b_start, b_end)), returns
+        a zero-copy reshaped view [len(block_ids) * chunk_size, num_heads, head_dim]
+        directly from the pinned memory slab.
+
+        For non-contiguous block sequences, copies blocks into an internal
+        page-locked staging buffer to provide a single contiguous pinned tensor
+        for PCIe DMA transfer.
+
+        Args:
+            block_ids: List of allocated block indices.
+
+        Returns:
+            Tuple of (k_quant, k_scale, v_quant, v_scale) contiguous pinned host tensors.
+        """
+        if not block_ids:
+            empty_kv = torch.empty(
+                (0, self.num_heads, self.head_dim), dtype=torch.int8, device="cpu"
+            )
+            empty_s = torch.empty((0, self.num_heads, 1), dtype=torch.float16, device="cpu")
+            return empty_kv, empty_s, empty_kv, empty_s
+
+        for b in block_ids:
+            self.touch(b)
+
+        if len(block_ids) == 1:
+            b0 = block_ids[0]
+            return (
+                self.k_quant[b0],
+                self.k_scale[b0],
+                self.v_quant[b0],
+                self.v_scale[b0],
+            )
+
+        is_contiguous = block_ids[-1] - block_ids[0] == len(block_ids) - 1 and all(
+            block_ids[i] == block_ids[0] + i for i in range(len(block_ids))
+        )
+        total_tokens = len(block_ids) * self.chunk_size
+
+        if is_contiguous:
+            b_start = block_ids[0]
+            b_end = block_ids[-1] + 1
+            # Zero-copy slice view into page-locked pinned memory
+            return (
+                self.k_quant[b_start:b_end].reshape(total_tokens, self.num_heads, self.head_dim),
+                self.k_scale[b_start:b_end].reshape(total_tokens, self.num_heads, 1),
+                self.v_quant[b_start:b_end].reshape(total_tokens, self.num_heads, self.head_dim),
+                self.v_scale[b_start:b_end].reshape(total_tokens, self.num_heads, 1),
+            )
+
+        # Non-contiguous sequence: coalesce into internal page-locked staging buffer
+        if len(block_ids) > self._staging_capacity:
+            self._expand_staging(len(block_ids))
+
+        for idx, b in enumerate(block_ids):
+            st = idx * self.chunk_size
+            en = st + self.chunk_size
+            self._stage_kq[st:en].copy_(self.k_quant[b], non_blocking=False)
+            self._stage_ks[st:en].copy_(self.k_scale[b], non_blocking=False)
+            self._stage_vq[st:en].copy_(self.v_quant[b], non_blocking=False)
+            self._stage_vs[st:en].copy_(self.v_scale[b], non_blocking=False)
+
+        return (
+            self._stage_kq[:total_tokens],
+            self._stage_ks[:total_tokens],
+            self._stage_vq[:total_tokens],
+            self._stage_vs[:total_tokens],
+        )
+
+    def _expand_staging(self, required_blocks: int) -> None:
+        """Expand page-locked staging buffers to hold required_blocks."""
+        new_cap = max(required_blocks, self._staging_capacity * 2)
+        kq = torch.empty(
+            (new_cap * self.chunk_size, self.num_heads, self.head_dim),
+            dtype=torch.int8,
+            device="cpu",
+        )
+        ks = torch.empty(
+            (new_cap * self.chunk_size, self.num_heads, 1),
+            dtype=torch.float16,
+            device="cpu",
+        )
+        vq = torch.empty(
+            (new_cap * self.chunk_size, self.num_heads, self.head_dim),
+            dtype=torch.int8,
+            device="cpu",
+        )
+        vs = torch.empty(
+            (new_cap * self.chunk_size, self.num_heads, 1),
+            dtype=torch.float16,
+            device="cpu",
+        )
+        if self._is_pinned:
+            try:
+                kq = kq.pin_memory()
+                ks = ks.pin_memory()
+                vq = vq.pin_memory()
+                vs = vs.pin_memory()
+            except Exception as e:
+                logger.warning("Failed to pin expanded staging buffers: %s", e)
+
+        self._stage_kq = kq
+        self._stage_ks = ks
+        self._stage_vq = vq
+        self._stage_vs = vs
+        self._staging_capacity = new_cap
 
     def get_start_pos(self, block_id: int) -> int:
         """Fetch the original token start position (p_cached) for a block."""

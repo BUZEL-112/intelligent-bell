@@ -168,16 +168,56 @@ class MultiLayerKVInjector:
         self.chunk_size = chunk_size
         self.max_blocks = max_blocks
 
-        # Layer-wise pinned memory pools
+        # Contiguous multi-layer page-locked host memory buffers:
+        # Layout: [num_layers, max_blocks, chunk_size, num_kv_heads, head_dim]
+        self.unified_k_quant = torch.empty(
+            (num_layers, max_blocks, chunk_size, num_kv_heads, head_dim),
+            dtype=torch.int8,
+            device="cpu",
+        )
+        self.unified_k_scale = torch.empty(
+            (num_layers, max_blocks, chunk_size, num_kv_heads, 1),
+            dtype=torch.float16,
+            device="cpu",
+        )
+        self.unified_v_quant = torch.empty(
+            (num_layers, max_blocks, chunk_size, num_kv_heads, head_dim),
+            dtype=torch.int8,
+            device="cpu",
+        )
+        self.unified_v_scale = torch.empty(
+            (num_layers, max_blocks, chunk_size, num_kv_heads, 1),
+            dtype=torch.float16,
+            device="cpu",
+        )
+        if torch.cuda.is_available():
+            try:
+                self.unified_k_quant = self.unified_k_quant.pin_memory()
+                self.unified_k_scale = self.unified_k_scale.pin_memory()
+                self.unified_v_quant = self.unified_v_quant.pin_memory()
+                self.unified_v_scale = self.unified_v_scale.pin_memory()
+            except Exception as e:
+                logger.warning("Failed to pin unified multi-layer host memory: %s", e)
+
+        # Layer-wise pinned memory pools backed by zero-copy views into unified slabs
         self.layer_pools: list[PinnedKVPool] = [
             PinnedKVPool(
                 max_blocks=max_blocks,
                 chunk_size=chunk_size,
                 num_heads=num_kv_heads,
                 head_dim=head_dim,
+                k_quant_slab=self.unified_k_quant[layer_idx],
+                k_scale_slab=self.unified_k_scale[layer_idx],
+                v_quant_slab=self.unified_v_quant[layer_idx],
+                v_scale_slab=self.unified_v_scale[layer_idx],
             )
-            for _ in range(num_layers)
+            for layer_idx in range(num_layers)
         ]
+
+        # Dedicated persistent CUDA transfer stream for overlapped DMA
+        self._transfer_stream = (
+            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        )
 
     def format_to_model_layout(self, x: torch.Tensor) -> torch.Tensor:
         """Convert [T, H, D] into [1, H, T, D] expected by HuggingFace attention.
@@ -368,55 +408,92 @@ class MultiLayerKVInjector:
         Returns:
             HuggingFace-compatible past_key_values tuple of (K_layer, V_layer).
         """
-        logger.debug(
-            "reconstruct_and_inject_multi_layer: blocks=%s delta_ps=%s num_layers=%d",
-            block_ids,
-            delta_ps,
-            self.num_layers,
-        )
-        transfer_stream = (
-            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
-        )
+        if not block_ids:
+            return cache.to_legacy_cache()
 
-        # Precompute RoPE cos/sin delta tables for unique position shifts
-        cos_sin_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        for dp in set(delta_ps):
-            cos_sin_cache[dp] = compute_rope_cos_sin_delta(
-                torch.tensor([dp], device=self.device),
+        # Step 1: Precompute RoPE cos/sin delta tables ONCE before the layer loop.
+        # When all delta_ps are identical (e.g. constant prompt shift),
+        # compute [1, D // 2] table for zero-overhead Triton register broadcasting.
+        if len(set(delta_ps)) == 1:
+            dp_const = delta_ps[0]
+            cos_d, sin_d = compute_rope_cos_sin_delta(
+                torch.tensor([dp_const], device=self.device),
                 head_dim=self.head_dim,
                 device=self.device,
             )
-
-        for layer_idx in range(self.num_layers):
-            layer_k_chunks: list[torch.Tensor] = []
-            layer_v_chunks: list[torch.Tensor] = []
-
-            for b_id, dp in zip(block_ids, delta_ps, strict=True):
-                cos_d, sin_d = cos_sin_cache[dp]
-                k_chunk, v_chunk = self.reconstruct_layer_chunk(
-                    layer_idx=layer_idx,
-                    block_id=b_id,
-                    delta_p=dp,
-                    cos_delta=cos_d,
-                    sin_delta=sin_d,
-                    transfer_stream=transfer_stream,
+        else:
+            # Different position shifts per chunk: expand across full sequence length T
+            unique_shifts = set(delta_ps)
+            shift_cache = {
+                dp: compute_rope_cos_sin_delta(
+                    torch.tensor([dp], device=self.device),
+                    head_dim=self.head_dim,
+                    device=self.device,
                 )
-                layer_k_chunks.append(k_chunk)
-                layer_v_chunks.append(v_chunk)
+                for dp in unique_shifts
+            }
+            cos_parts = [shift_cache[dp][0].expand(self.chunk_size, -1) for dp in delta_ps]
+            sin_parts = [shift_cache[dp][1].expand(self.chunk_size, -1) for dp in delta_ps]
+            cos_d = torch.cat(cos_parts, dim=0)
+            sin_d = torch.cat(sin_parts, dim=0)
 
-            if layer_k_chunks:
-                layer_k_full = torch.cat(layer_k_chunks, dim=0)
-                layer_v_full = torch.cat(layer_v_chunks, dim=0)
-                self.inject_layer_kv(
-                    cache=cache,
-                    layer_idx=layer_idx,
-                    k_tensor=layer_k_full,
-                    v_tensor=layer_v_full,
-                    delta_p=0,  # Already shifted inside reconstruct_layer_chunk
-                )
-
+        # Step 2: Coalesced DMA transfers and fused Triton execution across layers.
+        # Overlaps PCIe Copy Engine with GPU SM compute stream.
         if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+            compute_stream = torch.cuda.current_stream(self.device)
+            transfer_stream = self._transfer_stream or torch.cuda.Stream(device=self.device)
+
+            transfer_events: list[torch.cuda.Event] = []
+            gpu_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+            # Coalesced asynchronous DMA transfers across all layers on transfer_stream
+            with torch.cuda.stream(transfer_stream):
+                for layer_idx in range(self.num_layers):
+                    pool = self.layer_pools[layer_idx]
+                    kq_h, ks_h, vq_h, vs_h = pool.get_coalesced_views(block_ids)
+                    kq_g = kq_h.to(self.device, non_blocking=True)
+                    ks_g = ks_h.to(self.device, non_blocking=True)
+                    vq_g = vq_h.to(self.device, non_blocking=True)
+                    vs_g = vs_h.to(self.device, non_blocking=True)
+                    gpu_tensors.append((kq_g, ks_g, vq_g, vs_g))
+
+                    ev = torch.cuda.Event()
+                    ev.record(transfer_stream)
+                    transfer_events.append(ev)
+
+            # Dequantize with fused Triton and inject into cache on compute_stream
+            for layer_idx in range(self.num_layers):
+                compute_stream.wait_event(transfer_events[layer_idx])
+                kq_g, ks_g, vq_g, vs_g = gpu_tensors[layer_idx]
+
+                if TRITON_AVAILABLE:
+                    k_out = triton_fused_k_dequant_rope_shift(
+                        kq_g, ks_g, cos_delta=cos_d, sin_delta=sin_d
+                    )
+                    v_out = dequant_value(vq_g, vs_g)
+                else:
+                    k_out = pytorch_eager_dequant_rope_shift(
+                        kq_g, ks_g, cos_delta=cos_d, sin_delta=sin_d
+                    )
+                    v_out = dequant_value_ref(vq_g, vs_g)
+
+                k_fmt = self.format_to_model_layout(k_out)
+                v_fmt = self.format_to_model_layout(v_out)
+                cache.update(k_fmt, v_fmt, layer_idx=layer_idx)
+
+            compute_stream.wait_stream(transfer_stream)
+        else:
+            # CPU fallback execution
+            for layer_idx in range(self.num_layers):
+                pool = self.layer_pools[layer_idx]
+                kq_h, ks_h, vq_h, vs_h = pool.get_coalesced_views(block_ids)
+                k_out = pytorch_eager_dequant_rope_shift(
+                    kq_h, ks_h, cos_delta=cos_d, sin_delta=sin_d
+                )
+                v_out = dequant_value_ref(vq_h, vs_h)
+                k_fmt = self.format_to_model_layout(k_out)
+                v_fmt = self.format_to_model_layout(v_out)
+                cache.update(k_fmt, v_fmt, layer_idx=layer_idx)
 
         return cache.to_legacy_cache()
 

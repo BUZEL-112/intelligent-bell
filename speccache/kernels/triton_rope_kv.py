@@ -235,6 +235,9 @@ if TRITON_AVAILABLE:
             + offs_d[None, None, :] * stride_od
         )
         tl.store(out_ptrs, out.to(tl.float16), mask=mask_3d)
+else:
+    fused_k_dequant_rope_shift_kernel = None  # type: ignore
+    _dequant_value_kernel_2d = None  # type: ignore
 
 
 def triton_fused_k_dequant_rope_shift(
