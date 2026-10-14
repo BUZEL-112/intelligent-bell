@@ -127,14 +127,36 @@ class PinnedKVPool:
         """Number of unoccupied block slots available without eviction."""
         return len(self._free_block_ids)
 
-    def allocate(self) -> int:
+    @property
+    def allocated_blocks(self) -> List[int]:
+        """List of active block IDs currently held in the pool."""
+        return list(self._active_lru.keys())
+
+    def allocate(self, block_id: Optional[int] = None, start_pos: int = -1) -> int:
         """Allocate a block slot from the arena in O(1).
 
-        If the pool is full, evicts the least recently used block via OrderedDict.
+        If block_id is specified, reserves that slot directly.
+        Otherwise pops from free slots or evicts LRU block.
+
+        Args:
+            block_id: Optional specific block index in [0, max_blocks).
+            start_pos: Initial token start position tracking.
 
         Returns:
             block_id: Integer index in [0, max_blocks).
         """
+        if block_id is not None:
+            if block_id in self._free_block_ids:
+                self._free_block_ids.remove(block_id)
+            meta = OriginalPositionMetadata(
+                block_id=block_id,
+                start_pos=start_pos,
+                created_at=time.time(),
+                last_accessed=time.time(),
+            )
+            self._active_lru[block_id] = meta
+            return block_id
+
         if self._free_block_ids:
             block_id = self._free_block_ids.pop()
         else:
@@ -145,7 +167,7 @@ class PinnedKVPool:
 
         meta = OriginalPositionMetadata(
             block_id=block_id,
-            start_pos=-1,
+            start_pos=start_pos,
             created_at=time.time(),
             last_accessed=time.time(),
         )

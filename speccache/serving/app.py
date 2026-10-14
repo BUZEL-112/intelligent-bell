@@ -211,7 +211,7 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
         hit_rate = (hits / total) if total > 0 else 0.0
 
         pool = runner_instance.engine.pool
-        active_blocks = len(pool.allocated_blocks)
+        active_blocks = pool.allocated_count
         max_blocks = pool.max_blocks
         pool_utilization = (active_blocks / max_blocks * 100.0) if max_blocks > 0 else 0.0
 
@@ -243,7 +243,7 @@ def create_app(runner: Optional[SpecCacheLLMRunner] = None) -> FastAPI:
             "status": "healthy",
             "device": str(runner_instance.device),
             "pool_blocks_total": pool.max_blocks,
-            "pool_blocks_used": len(pool.allocated_blocks),
+            "pool_blocks_used": pool.allocated_count,
         }
 
     @app.get("/metrics")
