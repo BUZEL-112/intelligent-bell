@@ -1,0 +1,28 @@
+services:
+  speccache:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: speccache:latest
+    container_name: speccache-serving
+    ports:
+      - "8000:8000"
+    environment:
+      - SPECCACHE_LOG_LEVEL=INFO
+      - SPECCACHE_HOST=0.0.0.0
+      - SPECCACHE_PORT=8000
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/stats"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

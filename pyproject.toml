@@ -5,17 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "speccache"
 version = "0.1.0"
-description = "Phase 1: Hardware-aware semantic KV-cache engine fusing INT8 dequantization with relative RoPE phase-shifting"
+description = "Hardware-aware semantic KV-cache engine and speculative draft verification router for high-throughput LLM serving"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [
     { name = "SpecCache Engineering Team" }
 ]
-keywords = ["gpu", "triton", "llm", "kv-cache", "rope", "quantization"]
+keywords = ["gpu", "triton", "llm", "kv-cache", "rope", "quantization", "speculative-decoding"]
 dependencies = [
     "torch>=2.1.0",
     "triton>=2.1.0; sys_platform != 'win32'",
+    "numpy>=1.25.0",
+    "faiss-cpu>=1.7.4",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.22.0",
+    "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -23,10 +28,6 @@ dev = [
     "pytest>=7.4.0",
     "ruff>=0.1.0",
     "matplotlib>=3.7.0",
-    "faiss-cpu>=1.7.4",
-    "fastapi>=0.100.0",
-    "uvicorn>=0.22.0",
-    "pydantic>=2.0.0",
     "httpx>=0.24.0",
 ]
 
