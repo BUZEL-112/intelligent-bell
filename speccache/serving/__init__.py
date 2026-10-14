@@ -9,11 +9,13 @@ from speccache.serving.app import (
 )
 from speccache.serving.kv_injector import (
     KVInjector,
+    MultiLayerKVInjector,
     SpecDynamicCache,
 )
 from speccache.serving.pipeline import (
     GenerationChunk,
     GenerationResult,
+    InferenceMetrics,
     MockL4TransformerEngine,
     ModelOutput,
     RoutePath,
@@ -28,10 +30,12 @@ from speccache.serving.speculative import (
 __all__ = [
     "SpecDynamicCache",
     "KVInjector",
+    "MultiLayerKVInjector",
     "SpeculativeDraft",
     "VerificationResult",
     "SpeculativeVerifier",
     "RoutePath",
+    "InferenceMetrics",
     "GenerationChunk",
     "GenerationResult",
     "ModelOutput",

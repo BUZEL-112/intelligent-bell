@@ -41,9 +41,11 @@ from speccache.kernels.triton_rope_kv import (
 from speccache.serving import (
     GenerationChunk,
     GenerationResult,
+    InferenceMetrics,
     KVInjector,
     MockL4TransformerEngine,
     ModelOutput,
+    MultiLayerKVInjector,
     RoutePath,
     SpecCacheLLMRunner,
     SpecDynamicCache,
@@ -57,7 +59,9 @@ __all__ = [
     # Phase 3 Serving & Inference
     "GenerationChunk",
     "GenerationResult",
+    "InferenceMetrics",
     "KVInjector",
+    "MultiLayerKVInjector",
     "MockL4TransformerEngine",
     "ModelOutput",
     "RoutePath",

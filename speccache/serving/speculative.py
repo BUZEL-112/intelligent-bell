@@ -8,7 +8,7 @@ prefix, and emits 1 bonus token from the target logits at the first mismatch ind
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 import torch
 
 from speccache.serving.kv_injector import SpecDynamicCache
@@ -69,6 +69,70 @@ class SpeculativeVerifier:
         self.temperature = temperature
         self.top_p = top_p
 
+    def verify_draft_step(
+        self,
+        target_logits: torch.Tensor,
+        draft_tokens: Union[torch.Tensor, Sequence[int]],
+        prompt_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        """Verify candidate draft tokens against target model verification logits.
+
+        Compares target model predictions at positions [T-1 : T-1+gamma] against draft_tokens [0 : gamma].
+        Finds the first mismatch index k. Returns all accepted draft tokens draft_tokens[:k]
+        PLUS the target model's greedy/sampled token at index k (guaranteeing at least 1 valid
+        token and up to gamma + 1 tokens in a single forward pass).
+
+        Args:
+            target_logits: Target model output logits. Layout [seq_len, vocab_size] or
+                           [batch_size, seq_len, vocab_size].
+            draft_tokens: Candidate draft token IDs as 1D Tensor or integer sequence.
+            prompt_len: Length of the prompt prefix T. If omitted, takes the last
+                        (len(draft_tokens) + 1) positions of target_logits.
+
+        Returns:
+            Tuple of (accepted_draft_tokens: torch.Tensor, correction_token: int).
+        """
+        logits = target_logits
+        if logits.ndim == 3:
+            logits = logits.squeeze(0)  # [seq_len, vocab_size]
+
+        if not isinstance(draft_tokens, torch.Tensor):
+            draft_tensor = torch.tensor(draft_tokens, device=logits.device, dtype=torch.long)
+        else:
+            draft_tensor = draft_tokens.to(device=logits.device, dtype=torch.long).flatten()
+
+        num_draft = draft_tensor.numel()
+
+        # Extract logits covering positions [T-1 : T-1+gamma]
+        if prompt_len is not None and prompt_len > 0:
+            slice_start = prompt_len - 1
+            slice_end = slice_start + num_draft + 1
+            ver_logits = logits[slice_start:slice_end, :]
+        else:
+            # Slices the last num_draft + 1 positions
+            ver_logits = logits[-(num_draft + 1) :, :]
+
+        if ver_logits.shape[0] < num_draft + 1:
+            raise ValueError(
+                f"ver_logits length {ver_logits.shape[0]} is insufficient for "
+                f"{num_draft} draft tokens (requires {num_draft + 1})."
+            )
+
+        # Target predictions at each position
+        target_preds = ver_logits.argmax(dim=-1)  # [num_draft + 1]
+
+        # Find first mismatch index k
+        mismatch_k = num_draft
+        for k in range(num_draft):
+            if int(target_preds[k].item()) != int(draft_tensor[k].item()):
+                mismatch_k = k
+                break
+
+        accepted_tokens = draft_tensor[:mismatch_k]
+        correction_token = int(target_preds[mismatch_k].item())
+
+        return accepted_tokens, correction_token
+
     def verify_draft_tokens(
         self,
         draft_tokens: List[int],
@@ -121,7 +185,6 @@ class SpeculativeVerifier:
         rejection_idx: Optional[int] = None
         bonus_token: int = -1
 
-        # Check each candidate draft token against the target model prediction
         for j in range(num_draft):
             pred_token = int(logits[j].argmax(dim=-1).item())
             target_tokens.append(pred_token)
@@ -129,14 +192,10 @@ class SpeculativeVerifier:
             if pred_token == draft_tokens[j]:
                 accepted.append(draft_tokens[j])
             else:
-                # First mismatch: draft rejected here!
                 rejection_idx = j
-                # Bonus token is the target model's actual prediction at this position
                 bonus_token = pred_token
                 break
         else:
-            # All candidate draft tokens were accepted!
-            # Bonus token comes from the extra position (logits[num_draft])
             bonus_token = int(logits[num_draft].argmax(dim=-1).item())
             target_tokens.append(bonus_token)
 
@@ -166,24 +225,16 @@ class SpeculativeVerifier:
         probs = torch.softmax(logits / max(self.temperature, 1e-4), dim=-1)
 
         for j in range(num_draft):
-            candidate = draft_tokens[j]
-            target_p = float(probs[j, candidate].item())
+            sampled_token = int(torch.multinomial(probs[j], num_samples=1).item())
+            target_tokens.append(sampled_token)
 
-            # For greedy approximation or uniform rejection sampling:
-            # In standard speculative decoding with uniform/known draft prior, accept with min(1, p_target / p_draft)
-            # When draft prior is uniform or unknown, threshold against random draw:
-            r = torch.rand(1).item()
-            if r <= target_p or target_p >= 0.5:
-                accepted.append(candidate)
-                target_tokens.append(candidate)
+            if sampled_token == draft_tokens[j]:
+                accepted.append(draft_tokens[j])
             else:
                 rejection_idx = j
-                # Sample bonus token from target model distribution
-                bonus_token = int(torch.multinomial(probs[j], num_samples=1).item())
-                target_tokens.append(bonus_token)
+                bonus_token = sampled_token
                 break
         else:
-            # All accepted
             bonus_token = int(torch.multinomial(probs[num_draft], num_samples=1).item())
             target_tokens.append(bonus_token)
 
@@ -201,12 +252,21 @@ class SpeculativeVerifier:
     def rollback_cache(
         self,
         cache: SpecDynamicCache,
-        valid_seq_len: int,
+        target_seq_len: int,
     ) -> None:
-        """Roll back KV cache to discard key/value states beyond valid_seq_len.
+        """Roll back KV cache to target_seq_len, discarding rejected speculative candidate positions."""
+        cache.truncate(target_seq_len)
 
-        Args:
-            cache: SpecDynamicCache instance.
-            valid_seq_len: Prefix length containing accepted tokens + bonus token.
-        """
-        cache.truncate(valid_seq_len)
+    def verify_and_rollback(
+        self,
+        cache: SpecDynamicCache,
+        draft_tokens: List[int],
+        verification_logits: torch.Tensor,
+        prompt_len: int,
+        greedy: bool = True,
+    ) -> VerificationResult:
+        """Execute verification and automatically rollback KV cache in a single call."""
+        res = self.verify_draft_tokens(draft_tokens, verification_logits, greedy=greedy)
+        valid_seq_len = prompt_len + len(res.emitted_tokens)
+        self.rollback_cache(cache, valid_seq_len)
+        return res

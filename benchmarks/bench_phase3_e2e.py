@@ -1,14 +1,16 @@
 """End-to-End LLM Serving & Speculative Verification Benchmark for SpecCache Phase 3.
 
 Evaluates:
-1. End-to-End Time-To-First-Token (TTFT in ms) across prompt lengths T in [512, 1024, 2048, 4096, 8192]:
-   - Standard Prefill (No Cache Baseline): Full O(T^2) attention prefill.
-   - Path 3: Cold Miss (Full prefill + async INT8 quantization & host pool offload).
-   - Path 2: Speculative Draft Verification (0.80 <= s < 0.92, draft length gamma = 6).
-   - Path 1: Direct KV Reuse (Radix exact / s >= 0.92, pipelined DMA KV injection).
-2. Speculative Decode Throughput (tokens/sec) vs Draft Length gamma in [1, 2, 4, 6, 8]:
-   - Evaluates parallel target-model verification speedup over baseline autoregressive decode.
-3. Generates high-resolution dark-mode dual-panel publication figure -> benchmarks/phase3_e2e_serving.png.
+Panel 1: Time-To-First-Token (TTFT in ms) vs. Prompt Context Length (T in [512, 1024, 2048, 4096, 8192]):
+  - Standard Full GPU Prefill (Cold Miss)
+  - Naive FP16 Host Swap + Eager RoPE
+  - SpecCache (Pinned INT8 DMA + Fused Triton RoPE)
+Panel 2: Effective Decoding Throughput (Tokens/sec) across Speculative Acceptance Rates
+  (alpha in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0] for gamma = 6):
+  - Standard Autoregressive Decode (1 tok/pass)
+  - SpecCache Speculative Draft Routing
+
+Generates a formatted Markdown summary table and dark-mode dual-panel visualization -> benchmarks/phase3_e2e_serving.png.
 """
 
 import argparse
@@ -20,8 +22,13 @@ import numpy as np
 import torch
 
 from speccache.cache.engine import SpecCacheEngine
-from speccache.kernels.reference import quantize_kv_int8
-from speccache.serving.kv_injector import KVInjector, SpecDynamicCache
+from speccache.kernels.reference import (
+    compute_rope_cos_sin_delta,
+    pytorch_eager_dequant_rope_shift,
+    quantize_kv_int8,
+    rotate_half,
+)
+from speccache.serving.kv_injector import MultiLayerKVInjector, SpecDynamicCache
 from speccache.serving.pipeline import (
     MockL4TransformerEngine,
     RoutePath,
@@ -29,16 +36,29 @@ from speccache.serving.pipeline import (
 )
 from speccache.serving.speculative import SpeculativeVerifier
 
+try:
+    from speccache.kernels.triton_rope_kv import (
+        TRITON_AVAILABLE,
+        dequant_value,
+        triton_fused_k_dequant_rope_shift,
+    )
+except ImportError:
+    TRITON_AVAILABLE = False
+
+
+# ==============================================================================
+# Panel 1 Benchmarks: TTFT vs Context Length
+# ==============================================================================
 
 def benchmark_standard_prefill_ttft(
     model: MockL4TransformerEngine,
-    prompt_tokens: List[int],
-    warmup: int = 3,
-    iters: int = 10,
+    num_tokens: int,
+    warmup: int = 2,
+    iters: int = 6,
     device: torch.device = torch.device("cuda"),
 ) -> float:
-    """Measure TTFT for standard Transformer prefill without KV caching."""
-    input_t = torch.tensor([prompt_tokens], device=device)
+    """Measure TTFT for Standard Full GPU Prefill (Cold Miss)."""
+    input_t = torch.randint(0, model.vocab_size, (1, num_tokens), device=device)
 
     # Warmup
     for _ in range(warmup):
@@ -51,8 +71,8 @@ def benchmark_standard_prefill_ttft(
 
     start_event = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
     end_event = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+    timings: List[float] = []
 
-    timings_ms: List[float] = []
     for _ in range(iters):
         cache = SpecDynamicCache()
         if device.type == "cuda":
@@ -61,88 +81,187 @@ def benchmark_standard_prefill_ttft(
             _ = out.logits[:, -1, :].argmax(dim=-1)
             end_event.record()
             end_event.synchronize()
-            timings_ms.append(start_event.elapsed_time(end_event))
+            timings.append(start_event.elapsed_time(end_event))
         else:
             t0 = time.perf_counter()
             out = model.forward(input_t, past_key_values=cache)
             _ = out.logits[:, -1, :].argmax(dim=-1)
             t1 = time.perf_counter()
-            timings_ms.append((t1 - t0) * 1000.0)
+            timings.append((t1 - t0) * 1000.0)
 
-    return float(np.median(timings_ms))
+    return float(np.median(timings))
 
 
-def benchmark_runner_ttft(
-    runner: SpecCacheLLMRunner,
-    prompt_tokens: List[int],
+def benchmark_naive_fp16_swap_ttft(
+    model: MockL4TransformerEngine,
+    num_tokens: int,
+    delta_p: int = 64,
     warmup: int = 2,
-    iters: int = 10,
-) -> Tuple[float, RoutePath]:
-    """Measure TTFT for SpecCacheLLMRunner on a specific prompt."""
-    # Warmup
-    for _ in range(warmup):
-        _ = runner.generate(prompt_tokens=prompt_tokens, max_new_tokens=1)
-
-    timings_ms: List[float] = []
-    last_route = RoutePath.COLD_MISS
-
-    for _ in range(iters):
-        res = runner.generate(prompt_tokens=prompt_tokens, max_new_tokens=1)
-        timings_ms.append(res.ttft_ms)
-        last_route = res.route
-
-    return float(np.median(timings_ms)), last_route
-
-
-def benchmark_speculative_throughput(
-    runner: SpecCacheLLMRunner,
-    gamma: int,
-    prompt_len: int = 512,
-    total_tokens_to_generate: int = 64,
+    iters: int = 6,
     device: torch.device = torch.device("cuda"),
 ) -> float:
-    """Measure generation throughput (tokens/sec) for target-model speculative decoding."""
-    verifier = SpeculativeVerifier(gamma=gamma, temperature=0.0)
-    runner.speculative_verifier = verifier
-    runner.draft_gamma = gamma
+    """Measure TTFT for Naive FP16 Host Swap + Eager PyTorch RoPE."""
+    # Allocate uncompressed FP16 KV on pageable CPU host memory
+    k_host = [
+        torch.randn(1, model.num_kv_heads, num_tokens, model.head_dim, dtype=torch.float16)
+        for _ in range(model.num_layers)
+    ]
+    v_host = [
+        torch.randn(1, model.num_kv_heads, num_tokens, model.head_dim, dtype=torch.float16)
+        for _ in range(model.num_layers)
+    ]
 
-    prompt_tokens = list(range(100, 100 + prompt_len))
-    input_t = torch.tensor([prompt_tokens], device=device)
-    cache = SpecDynamicCache()
+    cos_d, sin_d = compute_rope_cos_sin_delta(
+        torch.tensor([delta_p], device=device), head_dim=model.head_dim, device=device
+    )
+    cos_full = torch.cat([cos_d, cos_d], dim=-1)[None, :, None, :].to(torch.float32)
+    sin_full = torch.cat([sin_d, sin_d], dim=-1)[None, :, None, :].to(torch.float32)
 
-    # Initial prefill
-    out = runner.model.forward(input_t, past_key_values=cache)
-    current_token = int(out.logits[:, -1, :].argmax(dim=-1).item())
+    last_token = torch.randint(0, model.vocab_size, (1, 1), device=device)
 
-    tokens_generated = 1
-    t0 = time.perf_counter()
-
-    # Speculative verification loop
-    # For synthetic benchmark, simulate high acceptance rate (e.g., 80%)
-    while tokens_generated < total_tokens_to_generate:
-        # Generate gamma draft tokens
-        draft_tokens = [(current_token + i + 1) % runner.model.vocab_size for i in range(gamma)]
-        verify_input = [current_token] + draft_tokens
-        verify_t = torch.tensor([verify_input], device=device)
-
-        out_ver = runner.model.forward(verify_t, past_key_values=cache)
-        logits = out_ver.logits[0, :, :]
-
-        # Verify against draft tokens
-        ver_res = verifier.verify_draft_tokens(draft_tokens, logits, greedy=True)
-        tokens_generated += ver_res.total_emitted
-        current_token = ver_res.bonus_token
-
-        # Rollback
-        valid_len = prompt_len + tokens_generated
-        verifier.rollback_cache(cache, valid_len)
+    # Warmup
+    for _ in range(warmup):
+        cache = SpecDynamicCache()
+        for l in range(model.num_layers):
+            k_g = k_host[l].to(device)
+            v_g = v_host[l].to(device)
+            k_rot = (k_g.to(torch.float32) * cos_full + rotate_half(k_g.to(torch.float32)) * sin_full).to(torch.float16)
+            cache.update(k_rot, v_g, layer_idx=l)
+        out = model.forward(last_token, past_key_values=cache)
+        _ = out.logits[:, -1, :].argmax(dim=-1)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
-    t1 = time.perf_counter()
-    duration = max(t1 - t0, 1e-5)
-    return tokens_generated / duration
+    timings: List[float] = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        cache = SpecDynamicCache()
+        for l in range(model.num_layers):
+            k_g = k_host[l].to(device)
+            v_g = v_host[l].to(device)
+            k_rot = (k_g.to(torch.float32) * cos_full + rotate_half(k_g.to(torch.float32)) * sin_full).to(torch.float16)
+            cache.update(k_rot, v_g, layer_idx=l)
+        out = model.forward(last_token, past_key_values=cache)
+        _ = out.logits[:, -1, :].argmax(dim=-1)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t1 = time.perf_counter()
+        timings.append((t1 - t0) * 1000.0)
+
+    return float(np.median(timings))
+
+
+def benchmark_speccache_pinned_dma_ttft(
+    model: MockL4TransformerEngine,
+    injector: MultiLayerKVInjector,
+    num_tokens: int,
+    chunk_size: int = 64,
+    delta_p: int = 64,
+    warmup: int = 2,
+    iters: int = 6,
+    device: torch.device = torch.device("cuda"),
+) -> float:
+    """Measure TTFT for SpecCache (Pinned INT8 DMA + Fused Triton RoPE)."""
+    num_chunks = num_tokens // chunk_size
+    block_ids = list(range(num_chunks))
+    delta_ps = [delta_p] * num_chunks
+    last_token = torch.randint(0, model.vocab_size, (1, 1), device=device)
+
+    # Warmup
+    for _ in range(warmup):
+        cache = SpecDynamicCache()
+        injector.reconstruct_and_inject_multi_layer(cache, block_ids=block_ids, delta_ps=delta_ps)
+        out = model.forward(last_token, past_key_values=cache)
+        _ = out.logits[:, -1, :].argmax(dim=-1)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    timings: List[float] = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        cache = SpecDynamicCache()
+        injector.reconstruct_and_inject_multi_layer(cache, block_ids=block_ids, delta_ps=delta_ps)
+        out = model.forward(last_token, past_key_values=cache)
+        _ = out.logits[:, -1, :].argmax(dim=-1)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t1 = time.perf_counter()
+        timings.append((t1 - t0) * 1000.0)
+
+    return float(np.median(timings))
+
+
+# ==============================================================================
+# Panel 2 Benchmarks: Speculative Throughput vs Acceptance Rate
+# ==============================================================================
+
+def benchmark_speculative_acceptance_rates(
+    model: MockL4TransformerEngine,
+    acceptance_rates: List[float],
+    gamma: int = 6,
+    prompt_len: int = 256,
+    tokens_to_generate: int = 120,
+    device: torch.device = torch.device("cuda"),
+) -> Tuple[float, List[float]]:
+    """Measure effective generation throughput across speculative acceptance rates alpha."""
+    prompt_ids = torch.randint(0, model.vocab_size, (1, prompt_len), device=device)
+
+    # Baseline: Standard Autoregressive Decode (1 token per step)
+    cache_base = SpecDynamicCache()
+    out = model.forward(prompt_ids, past_key_values=cache_base)
+    curr_tok = out.logits[:, -1, :].argmax(dim=-1)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    t0_base = time.perf_counter()
+    for _ in range(tokens_to_generate):
+        step_in = curr_tok.unsqueeze(0) if curr_tok.ndim == 1 else curr_tok
+        out = model.forward(step_in, past_key_values=cache_base)
+        curr_tok = out.logits[:, -1, :].argmax(dim=-1)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    base_tps = tokens_to_generate / max(time.perf_counter() - t0_base, 1e-4)
+
+    # Speculative Routing across acceptance rates alpha
+    spec_throughputs: List[float] = []
+
+    for alpha in acceptance_rates:
+        cache_spec = SpecDynamicCache()
+        out = model.forward(prompt_ids, past_key_values=cache_spec)
+        curr_tok = out.logits[:, -1, :].argmax(dim=-1)
+
+        generated = 0
+        t0_spec = time.perf_counter()
+
+        # Simulate speculative verification step with acceptance rate alpha
+        # Expected accepted tokens per pass: round(alpha * gamma)
+        k_accept = int(round(alpha * gamma))
+
+        while generated < tokens_to_generate:
+            # Parallel forward pass of prompt + draft tokens (length gamma + 1)
+            draft_input = torch.randint(0, model.vocab_size, (1, gamma + 1), device=device)
+            out_ver = model.forward(draft_input, past_key_values=cache_spec)
+            _ = out_ver.logits[:, -1, :].argmax(dim=-1)
+
+            # Emitted tokens: k_accept draft tokens + 1 bonus token
+            emitted_count = k_accept + 1
+            generated += emitted_count
+
+            # Roll back KV cache
+            cache_spec.truncate(prompt_len + generated)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        t1_spec = time.perf_counter()
+        tps = generated / max(t1_spec - t0_spec, 1e-4)
+        spec_throughputs.append(tps)
+
+    return base_tps, spec_throughputs
 
 
 # ==============================================================================
@@ -151,8 +270,11 @@ def benchmark_speculative_throughput(
 
 def render_phase3_dark_mode_plots(
     token_counts: List[int],
-    ttft_results: List[Dict[str, float]],
-    gamma_values: List[int],
+    ms_prefill: List[float],
+    ms_naive: List[float],
+    ms_speccache: List[float],
+    acceptance_rates: List[float],
+    base_tps: float,
     spec_throughputs: List[float],
     device_name: str,
     output_path: str,
@@ -162,34 +284,29 @@ def render_phase3_dark_mode_plots(
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6), dpi=300)
 
     # Color palette
-    c_prefill = "#ef4444"  # Red / Coral: Standard Prefill (No Cache)
-    c_cold = "#f59e0b"     # Amber: Path 3 Cold Miss + Quant
-    c_spec = "#a855f7"     # Purple: Path 2 Speculative Verification
-    c_reuse = "#00f0ff"    # Cyan: Path 1 Direct KV Reuse (SpecCache)
-    c_speedup = "#10b981"  # Emerald: Speedup callouts
+    c_prefill = "#ef4444"    # Red / Coral: Full Prefill Baseline
+    c_naive = "#f59e0b"      # Amber: Naive FP16 Host Swap
+    c_speccache = "#00f0ff"   # Electric Cyan: SpecCache
+    c_speedup = "#10b981"    # Emerald: Speedup callouts
+    c_spec = "#a855f7"       # Purple: Speculative decode
 
     # Panel 1: TTFT vs Context Tokens
-    ms_prefill = [r["prefill"] for r in ttft_results]
-    ms_cold = [r["cold_miss"] for r in ttft_results]
-    ms_spec = [r["spec_ver"] for r in ttft_results]
-    ms_reuse = [r["direct_reuse"] for r in ttft_results]
+    ax1.plot(token_counts, ms_prefill, "^--", color=c_prefill, linewidth=2.2, markersize=7, label="Standard Full GPU Prefill (Cold Miss)")
+    ax1.plot(token_counts, ms_naive, "s-.", color=c_naive, linewidth=2.2, markersize=7, label="Naive FP16 Host Swap + Eager RoPE")
+    ax1.plot(token_counts, ms_speccache, "o-", color=c_speccache, linewidth=3.0, markersize=8, label="SpecCache (Pinned INT8 DMA + Fused Triton RoPE)")
 
-    ax1.plot(token_counts, ms_prefill, "^--", color=c_prefill, linewidth=2.2, markersize=7, label="Standard Prefill (No Cache Baseline)")
-    ax1.plot(token_counts, ms_cold, "s:", color=c_cold, linewidth=2.0, markersize=7, label="Path 3: Cold Miss (+ INT8 Offload)")
-    ax1.plot(token_counts, ms_spec, "d-.", color=c_spec, linewidth=2.2, markersize=7, label="Path 2: Speculative Verification (s in [0.80, 0.92))")
-    ax1.plot(token_counts, ms_reuse, "o-", color=c_reuse, linewidth=3.0, markersize=8, label="Path 1: SpecCache Direct KV Reuse (s >= 0.92)")
-
-    # Annotate speedup at maximum context
+    # Speedup annotation at max context
     max_idx = -1
-    speedup_max = ms_prefill[max_idx] / max(ms_reuse[max_idx], 1e-4)
+    speedup_vs_prefill = ms_prefill[max_idx] / max(ms_speccache[max_idx], 1e-4)
+    speedup_vs_naive = ms_naive[max_idx] / max(ms_speccache[max_idx], 1e-4)
     ax1.annotate(
-        f"{speedup_max:.1f}x TTFT Speedup",
-        xy=(token_counts[max_idx], ms_reuse[max_idx]),
-        xytext=(token_counts[max_idx] * 0.45, ms_reuse[max_idx] * 2.8),
+        f"{speedup_vs_prefill:.1f}x vs Prefill\n{speedup_vs_naive:.1f}x vs FP16 Swap",
+        xy=(token_counts[max_idx], ms_speccache[max_idx]),
+        xytext=(token_counts[max_idx] * 0.38, ms_speccache[max_idx] * 4.0),
         arrowprops=dict(facecolor=c_speedup, edgecolor="none", shrink=0.08, width=1.5, headwidth=6),
         color=c_speedup,
         fontweight="bold",
-        fontsize=10,
+        fontsize=9,
         bbox=dict(boxstyle="round,pad=0.3", facecolor="#1e293b", edgecolor=c_speedup, alpha=0.9),
     )
 
@@ -197,15 +314,14 @@ def render_phase3_dark_mode_plots(
     ax1.set_yscale("log")
     ax1.set_xlabel("Prompt Context Tokens (T)", fontsize=11, fontweight="bold", color="#e2e8f0")
     ax1.set_ylabel("Time-To-First-Token (TTFT, ms) [Log Scale]", fontsize=11, fontweight="bold", color="#e2e8f0")
-    ax1.set_title(f"End-to-End TTFT vs Context Length ({device_name})", fontsize=12, fontweight="bold", color="#ffffff")
+    ax1.set_title(f"Time-To-First-Token (TTFT) vs Prompt Context Length ({device_name})", fontsize=12, fontweight="bold", color="#ffffff")
     ax1.set_xticks(token_counts)
     ax1.set_xticklabels([str(t) for t in token_counts], rotation=45, color="#cbd5e1")
     ax1.legend(frameon=True, facecolor="#0f172a", edgecolor="#334155", loc="upper left", fontsize=9)
     ax1.grid(True, linestyle="--", alpha=0.25, color="#475569")
 
-    # Panel 2: Speculative Decode Throughput vs Gamma
-    base_tps = spec_throughputs[0]  # gamma=1 baseline
-    x_positions = np.arange(len(gamma_values))
+    # Panel 2: Speculative Throughput vs Acceptance Rate
+    x_positions = np.arange(len(acceptance_rates))
     bars = ax2.bar(
         x_positions,
         spec_throughputs,
@@ -214,10 +330,19 @@ def render_phase3_dark_mode_plots(
         edgecolor="#c084fc",
         linewidth=1.2,
         alpha=0.85,
-        label="Speculative Decode Throughput",
+        label="SpecCache Speculative Draft Routing (gamma=6)",
     )
 
-    # Add speedup annotations above bars
+    # Baseline reference line
+    ax2.axhline(
+        base_tps,
+        color=c_prefill,
+        linestyle="--",
+        linewidth=2.0,
+        label=f"Standard Autoregressive Decode (1 tok/pass: {base_tps:.1f} t/s)",
+    )
+
+    # Annotate speedup above each bar
     for idx, (bar, tps) in enumerate(zip(bars, spec_throughputs)):
         speedup = tps / max(base_tps, 1e-4)
         ax2.text(
@@ -226,17 +351,17 @@ def render_phase3_dark_mode_plots(
             f"{speedup:.2f}x\n({tps:.1f} t/s)",
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=8.5,
             fontweight="bold",
             color="#38bdf8",
         )
 
-    ax2.set_xlabel("Candidate Draft Length (gamma)", fontsize=11, fontweight="bold", color="#e2e8f0")
-    ax2.set_ylabel("Generation Throughput (tokens / sec)", fontsize=11, fontweight="bold", color="#e2e8f0")
-    ax2.set_title("Speculative Verification Throughput Scaling", fontsize=12, fontweight="bold", color="#ffffff")
+    ax2.set_xlabel("Speculative Acceptance Rate (alpha)", fontsize=11, fontweight="bold", color="#e2e8f0")
+    ax2.set_ylabel("Effective Decoding Throughput (tokens / sec)", fontsize=11, fontweight="bold", color="#e2e8f0")
+    ax2.set_title("Effective Decoding Throughput across Acceptance Rates (gamma=6)", fontsize=12, fontweight="bold", color="#ffffff")
     ax2.set_xticks(x_positions)
-    ax2.set_xticklabels([f"gamma={g}" for g in gamma_values], color="#cbd5e1")
-    ax2.set_ylim(0, max(spec_throughputs) * 1.25)
+    ax2.set_xticklabels([f"alpha={a:.1f}" for a in acceptance_rates], color="#cbd5e1")
+    ax2.set_ylim(0, max(spec_throughputs) * 1.30)
     ax2.legend(frameon=True, facecolor="#0f172a", edgecolor="#334155", loc="upper left", fontsize=9)
     ax2.grid(True, linestyle="--", alpha=0.25, color="#475569", axis="y")
 
@@ -261,154 +386,133 @@ def main():
         help="Sequence lengths for TTFT evaluation",
     )
     parser.add_argument(
-        "--gammas",
-        type=int,
+        "--acceptance-rates",
+        type=float,
         nargs="+",
-        default=[1, 2, 4, 6, 8],
-        help="Candidate draft lengths for speculative throughput",
+        default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        help="Speculative acceptance rates alpha",
     )
-    parser.add_argument("--chunk-size", type=int, default=64, help="Tokens per cache chunk (default 64)")
-    parser.add_argument("--num-layers", type=int, default=8, help="Number of Transformer layers (default 8)")
-    parser.add_argument("--num-heads", type=int, default=8, help="Number of KV heads (default 8)")
+    parser.add_argument("--gamma", type=int, default=6, help="Draft length gamma (default 6)")
+    parser.add_argument("--num-layers", type=int, default=24, help="Transformer layers (default 24)")
+    parser.add_argument("--num-kv-heads", type=int, default=8, help="KV heads H_kv (default 8)")
+    parser.add_argument("--num-q-heads", type=int, default=16, help="Query heads H_q (default 16)")
     parser.add_argument("--head-dim", type=int, default=128, help="Head dimension D (default 128)")
+    parser.add_argument("--chunk-size", type=int, default=64, help="Tokens per chunk (default 64)")
     parser.add_argument("--output-plot", type=str, default="benchmarks/phase3_e2e_serving.png", help="Output PNG path")
     parser.add_argument("--device", type=str, default="cuda:0", help="Target device")
     args = parser.parse_args()
 
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         print("CUDA is not available on this system.")
-        print("SpecCache Phase 3 serving benchmarks require an NVIDIA GPU runtime (e.g. Google Colab).")
+        print("SpecCache Phase 3 benchmarks require an NVIDIA GPU runtime (e.g. Google Colab).")
         return
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
 
-    print("=" * 95)
+    print("=" * 105)
     print("SpecCache Phase 3: End-to-End LLM Serving & Speculative Verification Benchmark")
     print(f"Device: {device_name}")
-    print(f"Geometry: Layers={args.num_layers}, KV Heads={args.num_heads}, Head Dim={args.head_dim}, Chunk Size={args.chunk_size}")
-    print("=" * 95)
+    print(f"Model Architecture: Layers={args.num_layers}, H_q={args.num_q_heads}, H_kv={args.num_kv_heads}, D={args.head_dim}")
+    print(f"Serving Configuration: Chunk Size={args.chunk_size}, Speculative Draft Length gamma={args.gamma}")
+    print("=" * 105)
 
-    # 1. Initialize Mock Model and SpecCacheEngine
-    max_tokens = max(args.tokens)
-    max_blocks = (max_tokens // args.chunk_size) * 2 + 64
-
+    # 1. Initialize 24-layer L4 Transformer Stack
     model = MockL4TransformerEngine(
         num_layers=args.num_layers,
-        num_kv_heads=args.num_heads,
-        num_q_heads=args.num_heads * 2,
+        num_kv_heads=args.num_kv_heads,
+        num_q_heads=args.num_q_heads,
         head_dim=args.head_dim,
-        hidden_dim=args.num_heads * args.head_dim * 2,
+        hidden_dim=args.num_q_heads * args.head_dim,
         vocab_size=32000,
         device=device,
     )
 
-    engine = SpecCacheEngine(
-        chunk_size=args.chunk_size,
-        num_kv_heads=args.num_heads,
+    max_tokens = max(args.tokens)
+    max_blocks = max_tokens // args.chunk_size + 32
+
+    injector = MultiLayerKVInjector(
+        num_layers=args.num_layers,
+        num_kv_heads=args.num_kv_heads,
         head_dim=args.head_dim,
+        device=device,
         max_blocks=max_blocks,
-        embedding_dim=args.head_dim,
-        device=device,
-    )
-
-    runner = SpecCacheLLMRunner(
-        engine=engine,
-        model=model,
         chunk_size=args.chunk_size,
-        draft_gamma=6,
-        device=device,
     )
 
-    # Pre-populate engine with cached blocks for Direct Reuse and Speculative Verification
-    print("\nPre-populating Pinned KV Pool with context blocks...")
-    for t_len in args.tokens:
-        num_chunks = t_len // args.chunk_size
-        toks = list(range(t_len * 100, t_len * 100 + t_len))
-        for c in range(num_chunks):
-            c_toks = toks[c * args.chunk_size : (c + 1) * args.chunk_size]
-            raw_k = torch.randn((args.chunk_size, args.num_heads, args.head_dim), dtype=torch.float32)
-            raw_v = torch.randn((args.chunk_size, args.num_heads, args.head_dim), dtype=torch.float32)
-            kq, ks = quantize_kv_int8(raw_k)
-            vq, vs = quantize_kv_int8(raw_v)
-            emb = np.zeros(args.head_dim, dtype=np.float32)
-            emb[c % args.head_dim] = 1.0
-            cont = [(toks[-1] + j + 1) % 32000 for j in range(8)]
-            engine.register_chunk(
-                token_ids=c_toks,
-                cached_position=c * args.chunk_size,
+    # Pre-populate pinned pool with quantized chunks
+    print("Pre-populating layer-wise Pinned Host Memory Pools...")
+    for b_id in range(max_blocks):
+        for l in range(args.num_layers):
+            k_raw = torch.randn((args.chunk_size, args.num_kv_heads, args.head_dim), dtype=torch.float32)
+            v_raw = torch.randn((args.chunk_size, args.num_kv_heads, args.head_dim), dtype=torch.float32)
+            kq, ks = quantize_kv_int8(k_raw)
+            vq, vs = quantize_kv_int8(v_raw)
+            injector.layer_pools[l].allocate(block_id=b_id, start_pos=b_id * args.chunk_size)
+            injector.layer_pools[l].write_block(
+                block_id=b_id,
                 k_quant=kq,
                 k_scale=ks,
                 v_quant=vq,
                 v_scale=vs,
-                embedding=emb,
-                continuation_tokens=cont,
+                start_pos=b_id * args.chunk_size,
             )
 
-    # Part A: TTFT Evaluation across context lengths
-    print("\n### Part A: Time-To-First-Token (TTFT) Benchmark")
-    print("| Context (T) | Standard Prefill (ms) | Path 3 Cold Miss (ms) | Path 2 Speculative (ms) | Path 1 Direct Reuse (ms) | Speedup (Path 1 vs Base) |")
-    print("|------------:|----------------------:|----------------------:|------------------------:|-------------------------:|-------------------------:|")
+    # Panel 1: TTFT Benchmarking
+    print("\n### Panel 1: Time-To-First-Token (TTFT) vs Prompt Context Length")
+    print("| Context (T) | Full GPU Prefill (ms) | Naive FP16 Swap (ms) | SpecCache INT8 DMA (ms) | Speedup (vs Prefill) | Speedup (vs FP16 Swap) |")
+    print("|------------:|----------------------:|---------------------:|------------------------:|---------------------:|-----------------------:|")
 
-    ttft_results: List[Dict[str, float]] = []
+    ms_prefill: List[float] = []
+    ms_naive: List[float] = []
+    ms_speccache: List[float] = []
 
     for t in args.tokens:
-        prompt_tokens = list(range(t * 100, t * 100 + t))
-
-        # 1. Standard Prefill (Baseline)
-        ms_prefill = benchmark_standard_prefill_ttft(model, prompt_tokens, device=device)
-
-        # 2. Path 3: Cold Miss
-        cold_tokens = list(range(t * 500, t * 500 + t))
-        ms_cold, _ = benchmark_runner_ttft(runner, cold_tokens)
-
-        # 3. Path 1: Direct KV Reuse
-        ms_reuse, _ = benchmark_runner_ttft(runner, prompt_tokens)
-
-        # 4. Path 2: Speculative Verification
-        # Construct near-miss prompt: same length, 1 verification pass
-        ms_spec = ms_reuse * 1.35  # Approximate parallel verification overhead
-
-        speedup = ms_prefill / max(ms_reuse, 1e-4)
-
-        ttft_results.append({
-            "tokens": t,
-            "prefill": ms_prefill,
-            "cold_miss": ms_cold,
-            "spec_ver": ms_spec,
-            "direct_reuse": ms_reuse,
-            "speedup": speedup,
-        })
-
-        print(
-            f"| {t:>11} | {ms_prefill:>21.2f} | {ms_cold:>21.2f} | {ms_spec:>23.2f} | "
-            f"{ms_reuse:>24.2f} | {speedup:>24.2f}x |"
+        t_prefill = benchmark_standard_prefill_ttft(model, num_tokens=t, device=device)
+        t_naive = benchmark_naive_fp16_swap_ttft(model, num_tokens=t, device=device)
+        t_speccache = benchmark_speccache_pinned_dma_ttft(
+            model, injector, num_tokens=t, chunk_size=args.chunk_size, device=device
         )
 
-    # Part B: Speculative Generation Throughput
-    print("\n### Part B: Speculative Decoding Throughput vs Draft Length (gamma)")
-    print("| Draft Length (gamma) | Throughput (tokens/sec) | Speedup vs gamma=1 |")
-    print("|---------------------:|------------------------:|-------------------:|")
+        ms_prefill.append(t_prefill)
+        ms_naive.append(t_naive)
+        ms_speccache.append(t_speccache)
 
-    spec_throughputs: List[float] = []
-    base_tps = 1.0
+        sp_prefill = t_prefill / max(t_speccache, 1e-4)
+        sp_naive = t_naive / max(t_speccache, 1e-4)
 
-    for idx, g in enumerate(args.gammas):
-        tps = benchmark_speculative_throughput(runner, gamma=g, device=device)
-        if idx == 0:
-            base_tps = tps
-        speedup = tps / max(base_tps, 1e-4)
-        spec_throughputs.append(tps)
-        print(f"| {g:>20} | {tps:>23.2f} | {speedup:>18.2f}x |")
+        print(
+            f"| {t:>11} | {t_prefill:>21.2f} | {t_naive:>20.2f} | {t_speccache:>23.2f} | "
+            f"{sp_prefill:>20.2f}x | {sp_naive:>22.2f}x |"
+        )
 
-    print("=" * 95)
+    # Panel 2: Speculative Throughput Benchmarking
+    print(f"\n### Panel 2: Effective Decoding Throughput across Acceptance Rates (gamma={args.gamma})")
+    print("| Acceptance Rate (alpha) | Standard Autoregressive (t/s) | SpecCache Speculative (t/s) | Speedup Factor |")
+    print("|------------------------:|------------------------------:|----------------------------:|---------------:|")
+
+    base_tps, spec_throughputs = benchmark_speculative_acceptance_rates(
+        model,
+        acceptance_rates=args.acceptance_rates,
+        gamma=args.gamma,
+        device=device,
+    )
+
+    for a, s_tps in zip(args.acceptance_rates, spec_throughputs):
+        sp = s_tps / max(base_tps, 1e-4)
+        print(f"| {a:>24.1f} | {base_tps:>29.2f} | {s_tps:>27.2f} | {sp:>14.2f}x |")
+
+    print("=" * 105)
 
     # Render Dual-Panel Visualization
     print(f"\nSaving Phase 3 publication-grade benchmark plot -> {args.output_plot}")
     render_phase3_dark_mode_plots(
         token_counts=args.tokens,
-        ttft_results=ttft_results,
-        gamma_values=args.gammas,
+        ms_prefill=ms_prefill,
+        ms_naive=ms_naive,
+        ms_speccache=ms_speccache,
+        acceptance_rates=args.acceptance_rates,
+        base_tps=base_tps,
         spec_throughputs=spec_throughputs,
         device_name=device_name,
         output_path=args.output_plot,

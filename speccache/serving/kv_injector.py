@@ -2,15 +2,19 @@
 
 Provides:
 - SpecDynamicCache: High-performance Dynamic KV Cache compatible with HuggingFace DynamicCache.
-- KVInjector: Multi-layer injector translating contiguous Phase 1/2 INT8/FP16 reconstructed
-  chunks into model KV cache format ([batch_size, num_heads, seq_len, head_dim]).
+- MultiLayerKVInjector (KVInjector): Coordinates layer-wise PinnedKVPool slabs across num_layers
+  (e.g., 24, 28, or 32 layers). Coarsens DMA transfers across layers into past_key_values
+  to minimize Python loop overhead, applying triton_fused_k_dequant_rope_shift for keys
+  and dequantizing values.
 """
 
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 
+from speccache.cache.pinned_pool import PinnedKVPool
 from speccache.kernels.reference import (
     compute_rope_cos_sin_delta,
+    dequant_value_ref,
     pytorch_eager_dequant_rope_shift,
     rotate_half,
 )
@@ -18,10 +22,12 @@ from speccache.kernels.reference import (
 try:
     from speccache.kernels.triton_rope_kv import (
         TRITON_AVAILABLE,
+        dequant_value,
         triton_fused_k_dequant_rope_shift,
     )
 except ImportError:
     TRITON_AVAILABLE = False
+    dequant_value = dequant_value_ref  # type: ignore
 
 
 class SpecDynamicCache:
@@ -75,7 +81,6 @@ class SpecDynamicCache:
         Returns:
             Tuple of (cumulative_keys, cumulative_values) for the layer.
         """
-        # Expand layer cache capacity if needed
         while len(self.key_cache) <= layer_idx:
             self.key_cache.append(None)  # type: ignore
             self.value_cache.append(None)  # type: ignore
@@ -125,12 +130,13 @@ class SpecDynamicCache:
         return cache
 
 
-class KVInjector:
-    """Coordinates injection of SpecCache reconstructed KV blocks into LLM DynamicCache.
+class MultiLayerKVInjector:
+    """Manages layer-wise SpecCacheEngine / PinnedKVPool slabs across num_layers.
 
-    Translates between serving tensor layout [num_tokens, num_kv_heads, head_dim]
-    and standard HuggingFace layout [batch_size, num_kv_heads, num_tokens, head_dim].
-    Applies relative RoPE phase shifting when injecting at shifted sequence offsets.
+    Coarsens DMA transfers or batches across layers so reconstructing a full multi-layer
+    KV cache from pinned host memory into past_key_values (HuggingFace DynamicCache compatible
+    tuple of (K_layer, V_layer)) minimizes Python loop overhead.
+    Calls triton_fused_k_dequant_rope_shift for keys and dequantizes values.
     """
 
     def __init__(
@@ -139,19 +145,36 @@ class KVInjector:
         num_kv_heads: int,
         head_dim: int,
         device: Optional[torch.device] = None,
+        max_blocks: int = 128,
+        chunk_size: int = 64,
     ) -> None:
-        """Initialize KV Injector.
+        """Initialize MultiLayerKVInjector.
 
         Args:
-            num_layers: Number of Transformer layers.
+            num_layers: Number of Transformer layers (e.g., 24, 28, or 32).
             num_kv_heads: Number of key-value attention heads (GQA/MHA).
             head_dim: Head dimension D (e.g., 64, 128).
             device: Target GPU/CPU device.
+            max_blocks: Host pinned capacity in chunk blocks per layer.
+            chunk_size: Number of tokens per chunk.
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.chunk_size = chunk_size
+        self.max_blocks = max_blocks
+
+        # Layer-wise pinned memory pools
+        self.layer_pools: List[PinnedKVPool] = [
+            PinnedKVPool(
+                max_blocks=max_blocks,
+                chunk_size=chunk_size,
+                num_heads=num_kv_heads,
+                head_dim=head_dim,
+            )
+            for _ in range(num_layers)
+        ]
 
     def format_to_model_layout(self, x: torch.Tensor) -> torch.Tensor:
         """Convert [T, H, D] into [1, H, T, D] expected by HuggingFace attention.
@@ -159,7 +182,6 @@ class KVInjector:
         If already in [B, H, T, D], returns tensor unchanged.
         """
         if x.ndim == 3:
-            # [T, H, D] -> [1, H, T, D]
             return x.permute(1, 0, 2).unsqueeze(0).contiguous()
         elif x.ndim == 4:
             return x
@@ -172,7 +194,6 @@ class KVInjector:
         If already in [T, H, D], returns tensor unchanged.
         """
         if x.ndim == 4:
-            # [1, H, T, D] -> [T, H, D]
             return x.squeeze(0).permute(1, 0, 2).contiguous()
         elif x.ndim == 3:
             return x
@@ -226,15 +247,7 @@ class KVInjector:
         v_tensor: torch.Tensor,
         delta_p: int = 0,
     ) -> None:
-        """Inject Key and Value states into specified cache layer.
-
-        Args:
-            cache: Target SpecDynamicCache.
-            layer_idx: Layer index to populate.
-            k_tensor: Key tensor [T, H, D] or [1, H, T, D].
-            v_tensor: Value tensor [T, H, D] or [1, H, T, D].
-            delta_p: Relative RoPE displacement to apply to keys if not pre-shifted.
-        """
+        """Inject Key and Value states into specified cache layer."""
         k_formatted = self.format_to_model_layout(k_tensor)
         v_formatted = self.format_to_model_layout(v_tensor)
 
@@ -250,14 +263,7 @@ class KVInjector:
         layer_v_list: Sequence[torch.Tensor],
         delta_p: int = 0,
     ) -> None:
-        """Inject Key and Value states across all Transformer layers.
-
-        Args:
-            cache: Target SpecDynamicCache.
-            layer_k_list: Sequence of key tensors per layer.
-            layer_v_list: Sequence of value tensors per layer.
-            delta_p: Relative RoPE shift to apply if not already rotated.
-        """
+        """Inject Key and Value states across all Transformer layers."""
         if len(layer_k_list) != len(layer_v_list):
             raise ValueError(
                 f"Mismatch in layer counts: {len(layer_k_list)} keys vs {len(layer_v_list)} values"
@@ -271,3 +277,94 @@ class KVInjector:
                 v_tensor=v,
                 delta_p=delta_p,
             )
+
+    def reconstruct_layer_chunk(
+        self,
+        layer_idx: int,
+        block_id: int,
+        delta_p: int,
+        transfer_stream: Optional[torch.cuda.Stream] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct FP16 Key (with RoPE phase shift) and Value for a single layer chunk."""
+        pool = self.layer_pools[layer_idx]
+        kq_host, ks_host, vq_host, vs_host = pool.get_block_views(block_id)
+
+        # Asynchronous PCIe DMA from pinned host memory to GPU
+        if self.device.type == "cuda" and transfer_stream is not None:
+            with torch.cuda.stream(transfer_stream):
+                kq_gpu = kq_host.to(self.device, non_blocking=True)
+                ks_gpu = ks_host.to(self.device, non_blocking=True)
+                vq_gpu = vq_host.to(self.device, non_blocking=True)
+                vs_gpu = vs_host.to(self.device, non_blocking=True)
+        else:
+            kq_gpu = kq_host.to(self.device)
+            ks_gpu = ks_host.to(self.device)
+            vq_gpu = vq_host.to(self.device)
+            vs_gpu = vs_host.to(self.device)
+
+        # Dequantize and phase-shift Keys
+        if self.device.type == "cuda" and TRITON_AVAILABLE:
+            k_out = triton_fused_k_dequant_rope_shift(kq_gpu, ks_gpu, delta_p=delta_p)
+            v_out = dequant_value(vq_gpu, vs_gpu)
+        else:
+            k_out = pytorch_eager_dequant_rope_shift(kq_gpu, ks_gpu, delta_p=delta_p)
+            v_out = dequant_value_ref(vq_gpu, vs_gpu)
+
+        return k_out, v_out
+
+    def reconstruct_and_inject_multi_layer(
+        self,
+        cache: SpecDynamicCache,
+        block_ids: List[int],
+        delta_ps: List[int],
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+        """Coarsens DMA transfers across all layers and injects reconstructed KV cache.
+
+        Minimizes Python loop overhead by pre-batching chunks across layers and
+        directly populating SpecDynamicCache.
+
+        Args:
+            cache: SpecDynamicCache to inject reconstructed layers into.
+            block_ids: List of cached block IDs to reconstruct.
+            delta_ps: Position shifts (p_target - p_cached) corresponding to each block.
+
+        Returns:
+            HuggingFace-compatible past_key_values tuple of (K_layer, V_layer).
+        """
+        transfer_stream = (
+            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        )
+
+        for layer_idx in range(self.num_layers):
+            layer_k_chunks: List[torch.Tensor] = []
+            layer_v_chunks: List[torch.Tensor] = []
+
+            for b_id, dp in zip(block_ids, delta_ps):
+                k_chunk, v_chunk = self.reconstruct_layer_chunk(
+                    layer_idx=layer_idx,
+                    block_id=b_id,
+                    delta_p=dp,
+                    transfer_stream=transfer_stream,
+                )
+                layer_k_chunks.append(k_chunk)
+                layer_v_chunks.append(v_chunk)
+
+            if layer_k_chunks:
+                layer_k_full = torch.cat(layer_k_chunks, dim=0)
+                layer_v_full = torch.cat(layer_v_chunks, dim=0)
+                self.inject_layer_kv(
+                    cache=cache,
+                    layer_idx=layer_idx,
+                    k_tensor=layer_k_full,
+                    v_tensor=layer_v_full,
+                    delta_p=0,  # Already shifted inside reconstruct_layer_chunk
+                )
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+        return cache.to_legacy_cache()
+
+
+# Convenience backward compatibility alias
+KVInjector = MultiLayerKVInjector
