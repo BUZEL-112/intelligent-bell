@@ -24,6 +24,10 @@ dev = [
     "ruff>=0.1.0",
     "matplotlib>=3.7.0",
     "faiss-cpu>=1.7.4",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.22.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.24.0",
 ]
 
 [tool.setuptools.packages.find]

@@ -38,8 +38,35 @@ from speccache.kernels.triton_rope_kv import (
     fused_k_dequant_rope_shift_kernel,
     triton_fused_k_dequant_rope_shift,
 )
+from speccache.serving import (
+    GenerationChunk,
+    GenerationResult,
+    KVInjector,
+    MockL4TransformerEngine,
+    ModelOutput,
+    RoutePath,
+    SpecCacheLLMRunner,
+    SpecDynamicCache,
+    SpeculativeDraft,
+    SpeculativeVerifier,
+    VerificationResult,
+    create_app,
+)
 
 __all__ = [
+    # Phase 3 Serving & Inference
+    "GenerationChunk",
+    "GenerationResult",
+    "KVInjector",
+    "MockL4TransformerEngine",
+    "ModelOutput",
+    "RoutePath",
+    "SpecCacheLLMRunner",
+    "SpecDynamicCache",
+    "SpeculativeDraft",
+    "SpeculativeVerifier",
+    "VerificationResult",
+    "create_app",
     # Phase 2 Cache & Engine
     "BlockMetadata",
     "ChunkRoutingDecision",

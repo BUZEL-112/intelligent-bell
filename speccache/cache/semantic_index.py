@@ -56,6 +56,8 @@ class _VectorMeta:
     block_id: int
     cached_position: int
     is_active: bool = True
+    token_ids: Optional[Tuple[int, ...]] = None
+    continuation_tokens: List[int] = field(default_factory=list)
 
 
 class SemanticHNSWIndex:
@@ -167,6 +169,8 @@ class SemanticHNSWIndex:
             block_id=block_id,
             cached_position=cached_position,
             is_active=True,
+            token_ids=tuple(token_ids) if token_ids is not None else None,
+            continuation_tokens=list(continuation_tokens) if continuation_tokens is not None else [],
         )
         self._label_to_meta[label] = meta
         self._block_to_label[block_id] = label
@@ -245,6 +249,8 @@ class SemanticHNSWIndex:
                 similarity=best_sim,
                 block_id=best_meta.block_id,
                 cached_position=best_meta.cached_position,
+                token_ids=best_meta.token_ids,
+                continuation_tokens=best_meta.continuation_tokens,
             )
 
         return SemanticLookupResult(
@@ -252,6 +258,8 @@ class SemanticHNSWIndex:
             similarity=best_sim,
             block_id=best_meta.block_id,
             cached_position=best_meta.cached_position,
+            token_ids=best_meta.token_ids,
+            continuation_tokens=best_meta.continuation_tokens,
         )
 
     def remove(self, block_id: int) -> bool:

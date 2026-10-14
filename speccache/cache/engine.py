@@ -277,10 +277,10 @@ class SpecCacheEngine:
             # Tier 2: FAISS HNSW Semantic Vector Match
             # ------------------------------------------------------------------
             if emb is not None:
-                decision, similarity, block_id, cached_pos = self.semantic_index.query(emb)
+                sem_res = self.semantic_index.search(emb)
 
-                if decision == RouteDecision.EXACT_OR_REUSE and block_id is not None:
-                    p_cached = cached_pos if cached_pos is not None else self.pool.get_start_pos(block_id)
+                if sem_res.action == RouteDecision.EXACT_OR_REUSE and sem_res.block_id is not None:
+                    p_cached = sem_res.cached_position if sem_res.cached_position is not None else self.pool.get_start_pos(sem_res.block_id)
                     delta_p = p_target - p_cached
                     decisions.append(
                         ChunkRoutingDecision(
@@ -289,16 +289,17 @@ class SpecCacheEngine:
                             target_end_pos=p_target + self.chunk_size,
                             token_ids=c_toks,
                             status=ChunkRoutingStatus.SEMANTIC_REUSE,
-                            similarity=similarity,
-                            block_id=block_id,
+                            similarity=sem_res.similarity,
+                            block_id=sem_res.block_id,
                             cached_position=p_cached,
                             delta_p=delta_p,
+                            continuation_tokens=sem_res.continuation_tokens,
                         )
                     )
-                    self.pool.touch(block_id)
+                    self.pool.touch(sem_res.block_id)
                     continue
 
-                if decision == RouteDecision.SPECULATIVE and block_id is not None:
+                if sem_res.action == RouteDecision.SPECULATIVE and sem_res.block_id is not None:
                     decisions.append(
                         ChunkRoutingDecision(
                             chunk_index=i,
@@ -306,10 +307,11 @@ class SpecCacheEngine:
                             target_end_pos=p_target + self.chunk_size,
                             token_ids=c_toks,
                             status=ChunkRoutingStatus.SPECULATIVE_DRAFT,
-                            similarity=similarity,
-                            block_id=block_id,
-                            cached_position=cached_pos,
+                            similarity=sem_res.similarity,
+                            block_id=sem_res.block_id,
+                            cached_position=sem_res.cached_position,
                             delta_p=0,
+                            continuation_tokens=sem_res.continuation_tokens,
                         )
                     )
                     continue
