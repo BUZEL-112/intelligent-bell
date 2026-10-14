@@ -48,5 +48,4 @@ htmlcov/
 ~/.triton/
 
 # Benchmark artifacts
-*.png
 *.svg
