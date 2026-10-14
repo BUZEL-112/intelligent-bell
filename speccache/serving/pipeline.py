@@ -180,6 +180,7 @@ class MockL4TransformerEngine(nn.Module):
         input_ids: torch.Tensor,
         past_key_values: SpecDynamicCache | None = None,
         use_cache: bool = True,
+        return_last_logits_only: bool = False,
     ) -> ModelOutput:
         """Execute forward pass through multi-layer Transformer using real SDPA."""
         if past_key_values is None and use_cache:
@@ -208,6 +209,11 @@ class MockL4TransformerEngine(nn.Module):
             if past_key_values is not None:
                 k, v = past_key_values.update(k, v, layer_idx=layer_idx)
 
+            if k.dtype != q.dtype:
+                k = k.to(q.dtype)
+            if v.dtype != q.dtype:
+                v = v.to(q.dtype)
+
             # GQA head repeating
             if self.num_q_heads > self.num_kv_heads:
                 repeat_factor = self.num_q_heads // self.num_kv_heads
@@ -222,7 +228,10 @@ class MockL4TransformerEngine(nn.Module):
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, -1)
             x = x + self.out_proj[layer_idx](attn_out)
 
-        logits = self.lm_head(x)  # [B, T, vocab_size]
+        if return_last_logits_only:
+            logits = self.lm_head(x[:, -1:, :])
+        else:
+            logits = self.lm_head(x)  # [B, T, vocab_size]
         return ModelOutput(logits=logits, past_key_values=past_key_values)  # type: ignore
 
     def compute_embedding(self, token_ids: Sequence[int], embed_dim: int = 128) -> np.ndarray:
@@ -358,6 +367,7 @@ class SpecCacheLLMRunner:
             arr = arr / norm
         return arr.astype(np.float32)
 
+    @torch.inference_mode()
     def generate(
         self,
         prompt_tokens: list[int],
@@ -440,12 +450,16 @@ class SpecCacheLLMRunner:
 
             if trailing_tokens:
                 input_t = torch.tensor([trailing_tokens], device=self.device)
-                out = self.model.forward(input_t, past_key_values=cache)
+                out = self.model.forward(
+                    input_t, past_key_values=cache, return_last_logits_only=True
+                )
                 next_tok = int(out.logits[:, -1, :].argmax(dim=-1).item())
             else:
                 last_token = tokens[-1:]
                 input_t = torch.tensor([last_token], device=self.device)
-                out = self.model.forward(input_t, past_key_values=cache)
+                out = self.model.forward(
+                    input_t, past_key_values=cache, return_last_logits_only=True
+                )
                 next_tok = int(out.logits[:, -1, :].argmax(dim=-1).item())
 
             t_first_token = time.perf_counter()
@@ -483,7 +497,7 @@ class SpecCacheLLMRunner:
         # ======================================================================
         else:
             input_t = torch.tensor([tokens], device=self.device)
-            out = self.model.forward(input_t, past_key_values=cache)
+            out = self.model.forward(input_t, past_key_values=cache, return_last_logits_only=True)
             next_tok = int(out.logits[:, -1, :].argmax(dim=-1).item())
 
             t_first_token = time.perf_counter()

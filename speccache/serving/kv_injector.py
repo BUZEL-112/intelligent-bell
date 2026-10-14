@@ -286,6 +286,8 @@ class MultiLayerKVInjector:
         layer_idx: int,
         block_id: int,
         delta_p: int,
+        cos_delta: torch.Tensor | None = None,
+        sin_delta: torch.Tensor | None = None,
         transfer_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct FP16 Key (with RoPE phase shift) and Value for a single layer chunk."""
@@ -299,6 +301,7 @@ class MultiLayerKVInjector:
                 ks_gpu = ks_host.to(self.device, non_blocking=True)
                 vq_gpu = vq_host.to(self.device, non_blocking=True)
                 vs_gpu = vs_host.to(self.device, non_blocking=True)
+            torch.cuda.current_stream().wait_stream(transfer_stream)
         else:
             kq_gpu = kq_host.to(self.device)
             ks_gpu = ks_host.to(self.device)
@@ -307,11 +310,14 @@ class MultiLayerKVInjector:
 
         # Compute cos and sin delta tables for relative RoPE phase shift
         try:
-            cos_d, sin_d = compute_rope_cos_sin_delta(
-                torch.tensor([delta_p], device=self.device),
-                head_dim=self.head_dim,
-                device=self.device,
-            )
+            if cos_delta is None or sin_delta is None:
+                cos_d, sin_d = compute_rope_cos_sin_delta(
+                    torch.tensor([delta_p], device=self.device),
+                    head_dim=self.head_dim,
+                    device=self.device,
+                )
+            else:
+                cos_d, sin_d = cos_delta, sin_delta
 
             # Dequantize and phase-shift Keys
             if self.device.type == "cuda" and TRITON_AVAILABLE:
@@ -362,7 +368,7 @@ class MultiLayerKVInjector:
         Returns:
             HuggingFace-compatible past_key_values tuple of (K_layer, V_layer).
         """
-        logger.info(
+        logger.debug(
             "reconstruct_and_inject_multi_layer: blocks=%s delta_ps=%s num_layers=%d",
             block_ids,
             delta_ps,
@@ -372,15 +378,27 @@ class MultiLayerKVInjector:
             torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         )
 
+        # Precompute RoPE cos/sin delta tables for unique position shifts
+        cos_sin_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for dp in set(delta_ps):
+            cos_sin_cache[dp] = compute_rope_cos_sin_delta(
+                torch.tensor([dp], device=self.device),
+                head_dim=self.head_dim,
+                device=self.device,
+            )
+
         for layer_idx in range(self.num_layers):
             layer_k_chunks: list[torch.Tensor] = []
             layer_v_chunks: list[torch.Tensor] = []
 
             for b_id, dp in zip(block_ids, delta_ps, strict=True):
+                cos_d, sin_d = cos_sin_cache[dp]
                 k_chunk, v_chunk = self.reconstruct_layer_chunk(
                     layer_idx=layer_idx,
                     block_id=b_id,
                     delta_p=dp,
+                    cos_delta=cos_d,
+                    sin_delta=sin_d,
                     transfer_stream=transfer_stream,
                 )
                 layer_k_chunks.append(k_chunk)

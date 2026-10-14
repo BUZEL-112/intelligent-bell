@@ -2,6 +2,9 @@
 # SpecCache Phase 3: Automated Verification and End-to-End LLM Serving Benchmark
 set -e
 
+# Prevent CUDA memory fragmentation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 echo "======================================================================"
 echo "SpecCache Phase 3: End-to-End Serving & Speculative Verification"
 echo "======================================================================"
